@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -411,6 +412,214 @@ class ScopeCheckTests(VTeamTestCase):
             text=True,
             encoding="utf-8",
         )
+
+
+class CleanupTests(VTeamTestCase):
+    """description: 验证完成或废弃计划的证据校验、归档、重置和 handoff 清理。"""
+
+    def setUp(self) -> None:
+        """description: 初始化已注册 backend-1 的临时项目；输入为 unittest 生命周期；输出为可写计划。"""
+        super().setUp()
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+
+    @property
+    def plan_path(self) -> Path:
+        """description: 获取当前 Agent 活动计划路径；输入为 project_root；输出为 PLAN.md 路径。"""
+        return self.project_root / "Plan" / "agents" / "backend-1" / "PLAN.md"
+
+    @property
+    def handoffs_path(self) -> Path:
+        """description: 获取项目活动 handoff 路径；输入为 project_root；输出为 handoffs.md 路径。"""
+        return self.project_root / "Plan" / "collaboration" / "handoffs.md"
+
+    def build_plan(
+        self,
+        status: str,
+        task_rows: list[tuple[str, str, str, str, str]],
+        reason: str = "无。",
+        approval: str = "approved",
+    ) -> str:
+        """description: 构造清理测试计划；输入为状态、任务、原因和审批；输出为完整 Markdown。"""
+        rows = "\n".join(
+            f"| {task_id} | {summary} | {task_status} | {test_result} | {commit_hash} |"
+            for task_id, summary, task_status, test_result, commit_hash in task_rows
+        )
+        return (
+            "# backend-1 活动计划\n\n"
+            "- Agent ID: `backend-1`\n"
+            f"- Status: `{status}`\n"
+            f"- Approval: `{approval}`\n\n"
+            "## 当前目标\n\n"
+            "完成权限功能。\n\n"
+            "## 功能任务\n\n"
+            "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |\n"
+            "|---|---|---|---|---|\n"
+            f"{rows}\n\n"
+            "## 放弃原因\n\n"
+            f"- {reason}\n\n"
+            "## 整体完成结论\n\n"
+            "- 已记录。\n"
+        )
+
+    def write_plan(
+        self,
+        status: str,
+        task_rows: list[tuple[str, str, str, str, str]],
+        reason: str = "无。",
+        approval: str = "approved",
+    ) -> None:
+        """description: 写入清理测试计划；输入为计划字段；输出为空。"""
+        content = self.build_plan(status, task_rows, reason, approval)
+        self.plan_path.write_text(content, encoding="utf-8", newline="\n")
+
+    def run_cleanup(self) -> subprocess.CompletedProcess[str]:
+        """description: 运行 backend-1 清理命令；输入为固定身份；输出为 CLI 完成结果。"""
+        return self.run_cli(
+            "cleanup",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+    def test_draft_and_in_progress_plans_cannot_be_cleaned(self) -> None:
+        """description: 输入 draft 与 in-progress 计划；输出均拒绝且原计划不变。"""
+        for status in ["draft", "in-progress"]:
+            with self.subTest(status=status):
+                self.write_plan(status, [])
+                original_content = self.plan_path.read_text(encoding="utf-8")
+
+                result = self.run_cleanup()
+
+                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                self.assertIn(status, result.stderr)
+                self.assertEqual(
+                    original_content,
+                    self.plan_path.read_text(encoding="utf-8"),
+                )
+
+    def test_completed_plan_requires_tasks_tests_and_commit_hashes(self) -> None:
+        """description: 输入完成证据缺失的计划；输出拒绝并指出证据问题。"""
+        invalid_cases = [
+            ("缺少任务", []),
+            ("缺少测试", [("T1", "权限功能", "completed", "-", "abcdef1")]),
+            ("缺少提交", [("T1", "权限功能", "completed", "OK", "-")]),
+            ("任务未完成", [("T1", "权限功能", "pending", "OK", "abcdef1")]),
+        ]
+        for label, task_rows in invalid_cases:
+            with self.subTest(label=label):
+                self.write_plan("completed", task_rows)
+
+                result = self.run_cleanup()
+
+                self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+                self.assertIn("错误", result.stderr)
+                self.assertFalse(any((self.project_root / "Plan" / "archive").iterdir()))
+
+    def test_abandoned_plan_can_be_archived_with_reason(self) -> None:
+        """description: 输入含放弃原因的 abandoned 计划；输出归档成功；缺少原因时拒绝。"""
+        self.write_plan("abandoned", [], reason="用户取消该需求。")
+
+        accepted_result = self.run_cleanup()
+
+        self.assertEqual(0, accepted_result.returncode, accepted_result.stderr)
+        archive_files = list((self.project_root / "Plan" / "archive").glob("*.md"))
+        self.assertEqual(1, len(archive_files))
+        self.assertIn("用户取消该需求", archive_files[0].read_text(encoding="utf-8"))
+
+        self.write_plan("abandoned", [], reason="无。")
+        rejected_result = self.run_cleanup()
+        self.assertEqual(1, rejected_result.returncode)
+        self.assertIn("放弃原因", rejected_result.stderr)
+
+    def test_completed_plan_is_archived_and_active_plan_is_reset(self) -> None:
+        """description: 输入证据完整的完成计划；输出保留快照并重置为空白草稿。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成权限功能", "completed", "9 tests OK", "abcdef1")],
+        )
+
+        result = self.run_cleanup()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        archive_files = list((self.project_root / "Plan" / "archive").glob("*.md"))
+        self.assertEqual(1, len(archive_files))
+        archive_content = archive_files[0].read_text(encoding="utf-8")
+        self.assertIn("完成权限功能", archive_content)
+        self.assertIn("9 tests OK", archive_content)
+        self.assertIn("abcdef1", archive_content)
+        active_content = self.plan_path.read_text(encoding="utf-8")
+        self.assertIn("- Status: `draft`", active_content)
+        self.assertIn("当前无活动任务", active_content)
+        self.assertNotIn("完成权限功能", active_content)
+
+    def test_closed_handoffs_are_archived_and_removed_from_active_file(self) -> None:
+        """description: 输入已关闭和无关开放 handoff；输出关闭项归档移除且开放项保留。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+        )
+        handoffs = (
+            "# 当前跨 Agent 对接\n\n"
+            "| ID | 提出者 | 接收者 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | completed |\n"
+            "| H2 | backend-1 | tester-1 | 旧方案 | 无 | cancelled |\n"
+            "| H3 | data-1 | report-1 | 报表 | 页面可见 | open |\n"
+        )
+        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+
+        result = self.run_cleanup()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        active_handoffs = self.handoffs_path.read_text(encoding="utf-8")
+        self.assertNotIn("H1", active_handoffs)
+        self.assertNotIn("H2", active_handoffs)
+        self.assertIn("H3", active_handoffs)
+        archive_content = next(
+            (self.project_root / "Plan" / "archive").glob("*.md")
+        ).read_text(encoding="utf-8")
+        self.assertIn("H1", archive_content)
+        self.assertIn("H2", archive_content)
+
+    def test_open_handoff_involving_agent_blocks_completed_cleanup(self) -> None:
+        """description: 输入当前 Agent 参与的开放 handoff；输出拒绝完成计划清理。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+        )
+        handoffs = (
+            "# 当前跨 Agent 对接\n\n"
+            "| ID | 提出者 | 接收者 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | open |\n"
+        )
+        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+        original_plan = self.plan_path.read_text(encoding="utf-8")
+
+        result = self.run_cleanup()
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("H1", result.stderr)
+        self.assertEqual(original_plan, self.plan_path.read_text(encoding="utf-8"))
+
+    def test_archive_name_collision_creates_deterministic_suffix(self) -> None:
+        """description: 输入已存在的同日归档；输出新归档使用 -2 且不覆盖旧文件。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成权限功能", "completed", "OK", "abcdef1")],
+        )
+        archive_root = self.project_root / "Plan" / "archive"
+        first_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan.md"
+        first_archive.write_text("旧归档\n", encoding="utf-8")
+
+        result = self.run_cleanup()
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        second_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan-2.md"
+        self.assertTrue(second_archive.is_file())
+        self.assertEqual("旧归档\n", first_archive.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

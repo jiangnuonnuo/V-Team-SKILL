@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 from typing import Sequence
 
@@ -367,6 +368,347 @@ def check_scope(project_root: Path, agent_id: str) -> list[str]:
     ]
 
 
+def parse_markdown_row(line: str, expected_cells: int) -> list[str] | None:
+    """description: 解析固定列数的 Markdown 表格数据行。
+
+    Args:
+        line: 可能属于表格的一整行文本。
+        expected_cells: 业务表格要求的列数。
+
+    Returns:
+        数据单元格列表；非表格行、表头或分隔行返回 None。
+
+    Raises:
+        ValueError: 行是 Markdown 表格但列数不符合约定。
+    """
+    stripped_line = line.strip()
+    if not stripped_line.startswith("|") or not stripped_line.endswith("|"):
+        return None
+
+    cells = [cell.strip() for cell in stripped_line[1:-1].split("|")]
+    if all(not cell or set(cell) <= {"-", ":"} for cell in cells):
+        return None
+    if cells and cells[0] in {"ID", "Id", "id"}:
+        return None
+    if len(cells) != expected_cells:
+        raise ValueError(
+            f"Markdown 表格列数错误，预期 {expected_cells} 列，实际 {len(cells)} 列: {line}"
+        )
+    return cells
+
+
+def extract_markdown_section(content: str, heading: str) -> str:
+    """description: 提取二级标题下直到下一个标题前的当前内容。
+
+    Args:
+        content: 完整 Markdown 文本。
+        heading: 不含井号的二级标题名称。
+
+    Returns:
+        去除首尾空白的段落文本；标题不存在时返回空字符串。
+
+    Raises:
+        无。
+    """
+    pattern = re.compile(
+        rf"^##\s+{re.escape(heading)}\s*$\n(?P<body>.*?)(?=^##\s+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    match = pattern.search(content)
+    if match is None:
+        return ""
+    return match.group("body").strip()
+
+
+def read_plan_state(plan_path: Path) -> dict[str, object]:
+    """description: 解析个人活动计划的状态、审批、任务证据和放弃原因。
+
+    Args:
+        plan_path: `Plan/agents/<agent-id>/PLAN.md` 文件路径。
+
+    Returns:
+        包含原文、状态、审批、任务列表和放弃原因的字典。
+
+    Raises:
+        FileNotFoundError: 活动计划不存在。
+        ValueError: 必需元数据、任务表或表格格式无效。
+        OSError: 文件读取失败。
+    """
+    if not plan_path.is_file():
+        raise FileNotFoundError(f"缺少活动计划: {plan_path}")
+    content = plan_path.read_text(encoding="utf-8")
+
+    status_match = re.search(r"^- Status:\s*`([^`]+)`\s*$", content, re.MULTILINE)
+    if status_match is None:
+        raise ValueError("PLAN.md 缺少 `- Status: `<status>`` 元数据")
+    approval_match = re.search(
+        r"^- Approval:\s*`([^`]+)`\s*$",
+        content,
+        re.MULTILINE,
+    )
+    if approval_match is None:
+        raise ValueError("PLAN.md 缺少 `- Approval: `<status>`` 元数据")
+
+    task_heading = "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |"
+    if task_heading not in content:
+        raise ValueError("PLAN.md 缺少固定功能任务表头")
+
+    task_section = extract_markdown_section(content, "功能任务")
+    tasks: list[dict[str, str]] = []
+    for line_number, line in enumerate(task_section.splitlines(), start=1):
+        try:
+            cells = parse_markdown_row(line, 5)
+        except ValueError as error:
+            raise ValueError(f"PLAN.md 功能任务表第 {line_number} 行错误: {error}") from error
+        if cells is None:
+            continue
+        tasks.append(
+            {
+                "id": cells[0],
+                "summary": cells[1],
+                "status": cells[2],
+                "test_result": cells[3],
+                "commit": cells[4],
+            }
+        )
+
+    reason_section = extract_markdown_section(content, "放弃原因")
+    reason_lines = [
+        line.strip().removeprefix("-").strip()
+        for line in reason_section.splitlines()
+        if line.strip()
+    ]
+    abandoned_reason = " ".join(reason_lines).strip()
+    if abandoned_reason in {"-", "无", "无。"}:
+        abandoned_reason = ""
+
+    return {
+        "content": content,
+        "status": status_match.group(1).strip(),
+        "approval": approval_match.group(1).strip(),
+        "tasks": tasks,
+        "abandoned_reason": abandoned_reason,
+    }
+
+
+def parse_handoff_rows(handoffs_text: str) -> list[dict[str, str]]:
+    """description: 解析活动 handoff 表格中的业务数据行。
+
+    Args:
+        handoffs_text: `Plan/collaboration/handoffs.md` 完整文本。
+
+    Returns:
+        包含 ID、参与者、交付物、验收条件、状态和原行的字典列表。
+
+    Raises:
+        ValueError: handoff 表格行列数不符合固定格式。
+    """
+    rows: list[dict[str, str]] = []
+    for line_number, line in enumerate(handoffs_text.splitlines(), start=1):
+        try:
+            cells = parse_markdown_row(line, 6)
+        except ValueError as error:
+            raise ValueError(f"handoffs.md 第 {line_number} 行错误: {error}") from error
+        if cells is None:
+            continue
+        rows.append(
+            {
+                "id": cells[0],
+                "proposer": cells[1],
+                "receiver": cells[2],
+                "deliverable": cells[3],
+                "acceptance": cells[4],
+                "status": cells[5],
+                "raw_line": line.strip(),
+            }
+        )
+    return rows
+
+
+def validate_cleanup_state(
+    plan_state: dict[str, object],
+    handoffs_text: str,
+    agent_id: str,
+) -> None:
+    """description: 校验计划状态、完成证据和跨 Agent 依赖满足清理条件。
+
+    Args:
+        plan_state: `read_plan_state` 返回的活动计划事实。
+        handoffs_text: 当前活动 handoff 文本。
+        agent_id: 正在清理计划的 Agent ID。
+
+    Returns:
+        None。
+
+    Raises:
+        ValueError: 计划仍活动、审批或证据不完整、放弃原因缺失、存在未关闭依赖。
+    """
+    status = plan_state["status"]
+    if status not in {"completed", "abandoned"}:
+        raise ValueError(
+            f"计划状态 {status} 仍是活动状态，只允许清理 completed 或 abandoned 计划"
+        )
+
+    tasks = plan_state["tasks"]
+    if status == "completed":
+        if plan_state["approval"] != "approved":
+            raise ValueError("completed 计划缺少 approved 用户审批记录")
+        if not tasks:
+            raise ValueError("completed 计划至少需要一个完整功能或明确修复任务")
+        unfinished_task_ids = [
+            task["id"]
+            for task in tasks
+            if task["status"] != "completed"
+        ]
+        if unfinished_task_ids:
+            joined_ids = ", ".join(unfinished_task_ids)
+            raise ValueError(f"completed 计划仍有未完成任务: {joined_ids}")
+
+    if status == "abandoned" and not plan_state["abandoned_reason"]:
+        raise ValueError("abandoned 计划必须记录非空放弃原因")
+
+    commit_pattern = re.compile(r"^[0-9a-fA-F]{7,40}$")
+    for task in tasks:
+        if task["status"] != "completed":
+            continue
+        if task["test_result"] in {"", "-"}:
+            raise ValueError(f"已完成任务 {task['id']} 缺少测试结果")
+        if commit_pattern.fullmatch(task["commit"]) is None:
+            raise ValueError(f"已完成任务 {task['id']} 缺少有效本地提交哈希")
+
+    active_statuses = {"open", "in-progress"}
+    for handoff in parse_handoff_rows(handoffs_text):
+        involves_agent = agent_id in {
+            handoff["proposer"],
+            handoff["receiver"],
+        }
+        if involves_agent and handoff["status"] in active_statuses:
+            raise ValueError(
+                f"存在当前 Agent 参与的未关闭对接 {handoff['id']}: {handoff['status']}"
+            )
+
+
+def next_archive_path(archive_root: Path, agent_id: str, date_text: str) -> Path:
+    """description: 生成不会覆盖已有完成证据的确定性归档路径。
+
+    Args:
+        archive_root: 项目 `Plan/archive` 目录。
+        agent_id: 被归档计划的 Agent ID。
+        date_text: ISO 日期文本。
+
+    Returns:
+        首个不存在的 `<date>-<agent-id>-plan[-N].md` 路径。
+
+    Raises:
+        ValueError: Agent ID 不安全。
+    """
+    normalized_agent_id = validate_agent_id(agent_id)
+    first_candidate = archive_root / f"{date_text}-{normalized_agent_id}-plan.md"
+    if not first_candidate.exists():
+        return first_candidate
+
+    suffix = 2
+    while True:
+        candidate = archive_root / f"{date_text}-{normalized_agent_id}-plan-{suffix}.md"
+        if not candidate.exists():
+            return candidate
+        suffix += 1
+
+
+def remove_closed_handoffs(handoffs_text: str) -> tuple[str, list[str]]:
+    """description: 从活动 handoff 表移除已完成或已取消事项。
+
+    Args:
+        handoffs_text: 当前 handoffs.md 完整文本。
+
+    Returns:
+        精简后的活动文本，以及移除行的原始摘要列表。
+
+    Raises:
+        ValueError: 表格格式错误。
+    """
+    closed_statuses = {"completed", "cancelled"}
+    closed_rows = {
+        handoff["raw_line"]
+        for handoff in parse_handoff_rows(handoffs_text)
+        if handoff["status"] in closed_statuses
+    }
+    active_lines = [
+        line
+        for line in handoffs_text.splitlines()
+        if line.strip() not in closed_rows
+    ]
+    active_text = "\n".join(active_lines).rstrip() + "\n"
+    return active_text, sorted(closed_rows)
+
+
+def cleanup_agent_plan(project_root: Path, agent_id: str) -> Path:
+    """description: 归档完成或废弃计划，重置活动计划并清理关闭的 handoff。
+
+    Args:
+        project_root: 已初始化的 V-Team 项目根目录。
+        agent_id: 需要清理活动计划的 Agent ID。
+
+    Returns:
+        新生成的归档文件路径。
+
+    Raises:
+        FileNotFoundError: 个人计划或 handoff 文档不存在。
+        ValueError: Agent 不存在、计划或协作状态不满足清理条件。
+        OSError: 文件读取或写入失败。
+    """
+    normalized_agent_id = validate_agent_id(agent_id)
+    team = load_team(project_root)
+    registered_ids = {agent["id"] for agent in team["agents"]}
+    if normalized_agent_id not in registered_ids:
+        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
+
+    plan_path = (
+        project_root
+        / "Plan"
+        / "agents"
+        / normalized_agent_id
+        / "PLAN.md"
+    )
+    handoffs_path = project_root / "Plan" / "collaboration" / "handoffs.md"
+    if not handoffs_path.is_file():
+        raise FileNotFoundError(f"缺少协作文档: {handoffs_path}")
+
+    plan_state = read_plan_state(plan_path)
+    handoffs_text = handoffs_path.read_text(encoding="utf-8")
+    validate_cleanup_state(plan_state, handoffs_text, normalized_agent_id)
+    active_handoffs, closed_handoffs = remove_closed_handoffs(handoffs_text)
+
+    # 先写入新归档，任何后续失败都不会丢失原计划证据。
+    archive_root = project_root / "Plan" / "archive"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    archived_on = date.today().isoformat()
+    archive_path = next_archive_path(
+        archive_root,
+        normalized_agent_id,
+        archived_on,
+    )
+    closed_summary = "\n".join(closed_handoffs) if closed_handoffs else "- 无。"
+    archive_content = (
+        f"# {normalized_agent_id} 计划归档\n\n"
+        f"- Archived on: `{archived_on}`\n"
+        f"- Final status: `{plan_state['status']}`\n\n"
+        "## 活动计划快照\n\n"
+        f"{plan_state['content'].rstrip()}\n\n"
+        "## 本次移除的已关闭对接\n\n"
+        f"{closed_summary}\n"
+    )
+    write_text(archive_path, archive_content, overwrite=False)
+
+    reset_plan = render_template(
+        "plan-template.md",
+        {"AGENT_ID": normalized_agent_id},
+    )
+    write_text(plan_path, reset_plan)
+    write_text(handoffs_path, active_handoffs)
+    return archive_path
+
+
 def validate_agent_id(agent_id: str) -> str:
     """description: 校验 Agent ID 可以安全用作单级目录名。
 
@@ -717,7 +1059,7 @@ def build_parser() -> argparse.ArgumentParser:
         无。
 
     Returns:
-        包含 init、agent 与 check-scope 子命令的 ArgumentParser。
+        包含 init、agent、check-scope 与 cleanup 子命令的 ArgumentParser。
 
     Raises:
         无。
@@ -756,6 +1098,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scope_parser.add_argument("--project-root", required=True, type=Path)
     scope_parser.add_argument("--agent-id", required=True)
+
+    cleanup_parser = subparsers.add_parser(
+        "cleanup",
+        help="归档完成或废弃计划并重置活动上下文",
+    )
+    cleanup_parser.add_argument("--project-root", required=True, type=Path)
+    cleanup_parser.add_argument("--agent-id", required=True)
     return parser
 
 
@@ -815,6 +1164,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 2
+
+        if arguments.command == "cleanup":
+            archive_path = cleanup_agent_plan(
+                project_root=arguments.project_root,
+                agent_id=arguments.agent_id,
+            )
+            print(f"计划已归档并重置: {archive_path}")
+            return 0
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
