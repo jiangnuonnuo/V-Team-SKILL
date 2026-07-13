@@ -165,7 +165,7 @@ git commit -m "功能：支持项目初始化与Agent身份约束"
 - Modify: `scripts/vteam.py`
 - Modify: `tests/test_vteam.py`
 
-- [ ] **实现并验证“提交范围检查”完整功能，形成一次中文本地提交**
+- [x] **实现并验证“提交范围检查”完整功能，形成一次中文本地提交**
 
 先新增以下测试：
 
@@ -436,7 +436,7 @@ git commit -m "重构：完成多Agent协作开发技能"
 | 功能任务 | 状态 | 测试结果 | 本地提交 | 备注 |
 |---|---|---|---|---|
 | Task 1 初始化与 Agent 注册 | completed | 9 项测试通过；`py_compile` 通过 | `1c25eb4` | Windows 子进程输出按平台编码验证，生成文件保持 UTF-8 |
-| Task 2 提交范围检查 | pending | - | - | - |
+| Task 2 提交范围检查 | completed | 9 项功能测试、18 项累计回归通过 | `59a6bc0` | 只运行一次 `git diff --name-only HEAD`；授权不落永久配置 |
 | Task 3 计划归档与清理 | pending | - | - | - |
 | Task 4 技能契约与旧结构清理 | pending | - | - | - |
 
