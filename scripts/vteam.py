@@ -878,6 +878,14 @@ def validate_team(team: dict[str, object]) -> None:
                     f"team.json 字段 agents[{index}].{field_name} 类型错误"
                 )
 
+        scope_statement = agent.get("scope_statement")
+        if scope_statement is not None and (
+            not isinstance(scope_statement, str) or not scope_statement.strip()
+        ):
+            raise ValueError(
+                f"team.json 字段 agents[{index}].scope_statement 必须是非空字符串"
+            )
+
         agent_id = validate_agent_id(agent["id"])
         if agent_id in seen_agent_ids:
             raise ValueError(f"team.json 存在重复 agent id: {agent_id}")
@@ -1041,6 +1049,7 @@ def initialize_project(project_root: Path, runtimes: Sequence[str]) -> None:
     # 当前态文档只在缺失时创建，避免重复初始化覆盖真实项目进度。
     initial_files = {
         plan_root / "project.md": "project-template.md",
+        plan_root / "onboarding.md": "quick-onboarding-template.md",
         plan_root / "collaboration" / "architecture.md": "architecture-template.md",
         plan_root / "collaboration" / "api-contracts.md": "api-contracts-template.md",
         plan_root / "collaboration" / "handoffs.md": "handoffs-template.md",
@@ -1060,6 +1069,7 @@ def upsert_agent(
     modules: Sequence[str],
     write_whitelist: Sequence[str],
     collaboration_docs: Sequence[str],
+    scope_statement: str | None = None,
 ) -> None:
     """description: 新增或更新 Agent 身份事实与个人约束文件。
 
@@ -1072,6 +1082,7 @@ def upsert_agent(
         modules: Agent 默认负责的模块路径。
         write_whitelist: 无需额外授权即可提交的路径规则。
         collaboration_docs: 当前任务可能需要读取的协作文档路径。
+        scope_statement: 用户以自然语言授权的业务或项目范围；未提供时使用职责描述。
 
     Returns:
         None。
@@ -1085,10 +1096,17 @@ def upsert_agent(
     normalized_runtime = normalize_runtime_values([runtime])[0]
     normalized_role = role.strip()
     normalized_responsibility = responsibility.strip()
+    normalized_scope = (
+        scope_statement.strip()
+        if scope_statement is not None
+        else normalized_responsibility
+    )
     if not normalized_role:
         raise ValueError("role 不能为空")
     if not normalized_responsibility:
         raise ValueError("responsibility 不能为空")
+    if not normalized_scope:
+        raise ValueError("scope 不能为空")
 
     normalized_modules = [normalize_config_path(path) for path in modules]
     normalized_whitelist = [normalize_config_path(path) for path in write_whitelist]
@@ -1102,6 +1120,7 @@ def upsert_agent(
         "runtime": normalized_runtime,
         "role": normalized_role,
         "responsibility": normalized_responsibility,
+        "scope_statement": normalized_scope,
         "modules": normalized_modules,
         "write_whitelist": normalized_whitelist,
         "collaboration_docs": normalized_docs,
@@ -1133,6 +1152,7 @@ def upsert_agent(
             "RUNTIME": normalized_runtime,
             "ROLE": normalized_role,
             "RESPONSIBILITY": normalized_responsibility,
+            "SCOPE_STATEMENT": normalized_scope,
             "MODULES": format_markdown_list(normalized_modules),
             "WRITE_WHITELIST": format_markdown_list(normalized_whitelist),
             "COLLABORATION_DOCS": format_markdown_list(normalized_docs),
@@ -1185,6 +1205,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_parser.add_argument("--role", required=True)
     agent_parser.add_argument("--responsibility", required=True)
+    agent_parser.add_argument(
+        "--scope",
+        help="用户授权的业务或项目范围；未提供时使用 --responsibility",
+    )
     agent_parser.add_argument("--module", action="append", required=True)
     agent_parser.add_argument("--allow", action="append", required=True)
     agent_parser.add_argument("--read-doc", action="append", default=[])
@@ -1243,6 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 modules=arguments.module,
                 write_whitelist=arguments.allow,
                 collaboration_docs=arguments.read_doc,
+                scope_statement=arguments.scope,
             )
             print(f"Agent 已更新: {arguments.agent_id}")
             return 0

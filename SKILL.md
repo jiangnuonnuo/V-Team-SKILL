@@ -51,7 +51,9 @@ python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtim
 
 ### 2. 注册 Agent
 
-让用户明确指定 Agent ID、运行端、角色、职责、至少一个负责模块、永久写入白名单和需要读取的协作文档：
+用户可以直接以自然语言指定 Agent ID、角色和业务/项目范围。Agent 读取当前项目结构后，自行映射足以完成工作的模块、测试、配置与协作文档；映射唯一时直接注册，范围无法映射或与其他 Agent 明显争夺同一业务模块时才询问一个最小问题。初始化项目会生成项目内 `Plan/onboarding.md`，供后续独立会话使用。
+
+注册时使用 Agent ID、运行端、角色、职责、用户范围、至少一个负责模块、永久写入白名单和需要读取的协作文档：
 
 ```bash
 python <skill-root>/scripts/vteam.py agent \
@@ -60,19 +62,20 @@ python <skill-root>/scripts/vteam.py agent \
   --runtime codex \
   --role backend \
   --responsibility "用户与权限后端" \
+  --scope "用户与权限后端全部代码" \
   --module backend/auth \
   --allow backend/auth/ \
   --allow tests/auth/ \
   --read-doc Plan/collaboration/api-contracts.md
 ```
 
-同一角色可以注册多个不同 ID。`Plan/team.json` 是身份、运行端和白名单的机器事实源；重新生成个人约束时以它为准。
+同一角色可以注册多个不同 ID。`Plan/team.json` 保存身份、用户范围、运行端和白名单事实；重新生成个人约束时以它为准。`--scope` 未提供时兼容旧用法并使用 `--responsibility`。
 
 ### 3. 确认身份并读取最小上下文
 
 严格执行以下顺序：
 
-1. 从用户指令或当前任务上下文确认 `agent-id`；身份不明确时停止并询问用户。
+1. 从用户指令或当前任务上下文确认 `agent-id`；身份不明确时按 `Plan/onboarding.md` 快速入职，入职完成前禁止实现代码。
 2. 读取项目根 `AGENTS.md` 或 `CLAUDE.md`。
 3. 强制读取 `Plan/agents/<agent-id>/AGENT.md`；文件缺失时停止并要求先注册身份。
 4. 读取自己的 `PLAN.md` 和 `Plan/project.md`。
@@ -181,6 +184,7 @@ python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --age
 - `references/root-agents-template.md`：Codex 项目根约束模板。
 - `references/root-claude-template.md`：Claude 项目根约束模板。
 - `references/personal-agent-template.md`：个人身份、边界和行为模板。
+- `references/quick-onboarding-template.md`：从用户身份和业务范围生成个人约束的提示模板。
 - `references/plan-template.md`：唯一活动计划模板。
 - `references/project-template.md`：项目当前态模板。
 - `references/architecture-template.md`：架构当前态模板。

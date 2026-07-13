@@ -6,6 +6,7 @@
 
 - Codex 生成 `AGENTS.md`，Claude 生成 `CLAUDE.md`，混合团队同时生成两者。
 - 每个 Agent 使用独立 `Plan/agents/<agent-id>/AGENT.md` 和唯一 `PLAN.md`。
+- 用户只需给出 Agent 身份和业务/项目范围；Agent 据此映射完整工作范围并生成个人约束。
 - 每个计划任务保持完整功能或明确修复粒度；review 通过且用户批准后才能实现。
 - `check-plan` 校验固定 review 记录，语义 review 仍由独立 Agent 完成。
 - 本地提交前只运行一次 `git diff --name-only HEAD` 范围检查。
@@ -27,7 +28,7 @@
 ```powershell
 python "F:\java\code\SKILLS\V-Team-SKILL\scripts\vteam.py" init --project-root "F:\java\code\item\example-project" --runtime codex
 
-python "F:\java\code\SKILLS\V-Team-SKILL\scripts\vteam.py" agent --project-root "F:\java\code\item\example-project" --agent-id backend-1 --runtime codex --role backend --responsibility "用户与权限后端" --module backend/auth --allow backend/auth/ --allow tests/auth/ --read-doc Plan/collaboration/api-contracts.md
+python "F:\java\code\SKILLS\V-Team-SKILL\scripts\vteam.py" agent --project-root "F:\java\code\item\example-project" --agent-id backend-1 --runtime codex --role backend --responsibility "用户与权限后端" --scope "用户与权限后端全部代码" --module backend/auth --allow backend/auth/ --allow tests/auth/ --read-doc Plan/collaboration/api-contracts.md
 
 python "F:\java\code\SKILLS\V-Team-SKILL\scripts\vteam.py" check-plan --project-root "F:\java\code\item\example-project" --agent-id backend-1
 
@@ -43,7 +44,7 @@ python --version
 
 python "/Users/me/skills/V-Team-SKILL/scripts/vteam.py" init --project-root "/Users/me/projects/example-project" --runtime codex --runtime claude
 
-python "/Users/me/skills/V-Team-SKILL/scripts/vteam.py" agent --project-root "/Users/me/projects/example-project" --agent-id frontend-1 --runtime claude --role frontend --responsibility "登录页面与接口集成" --module frontend/auth --allow frontend/auth/ --read-doc Plan/collaboration/api-contracts.md
+python "/Users/me/skills/V-Team-SKILL/scripts/vteam.py" agent --project-root "/Users/me/projects/example-project" --agent-id frontend-1 --runtime claude --role frontend --responsibility "登录页面与接口集成" --scope "用户端前端全部代码" --module frontend/auth --allow frontend/auth/ --read-doc Plan/collaboration/api-contracts.md
 
 python "/Users/me/skills/V-Team-SKILL/scripts/vteam.py" check-plan --project-root "/Users/me/projects/example-project" --agent-id frontend-1
 
@@ -59,6 +60,7 @@ python "/Users/me/skills/V-Team-SKILL/scripts/vteam.py" cleanup --project-root "
   AGENTS.md or CLAUDE.md
   Plan/
     project.md
+    onboarding.md
     team.json
     agents/<agent-id>/AGENT.md
     agents/<agent-id>/PLAN.md

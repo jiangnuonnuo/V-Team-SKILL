@@ -6,6 +6,7 @@
 - Runtime: `{{RUNTIME}}`
 - Role: `{{ROLE}}`
 - Responsibility: {{RESPONSIBILITY}}
+- 用户授权范围：{{SCOPE_STATEMENT}}
 
 主要负责模块：
 

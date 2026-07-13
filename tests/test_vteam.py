@@ -155,6 +155,7 @@ class InitializationTests(VTeamTestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertFalse((self.project_root / "Plan" / "versions").exists())
         self.assertTrue((self.project_root / "Plan" / "project.md").is_file())
+        self.assertTrue((self.project_root / "Plan" / "onboarding.md").is_file())
         self.assertTrue((self.project_root / "Plan" / "team.json").is_file())
         self.assertTrue((self.project_root / "Plan" / "collaboration" / "architecture.md").is_file())
         self.assertTrue((self.project_root / "Plan" / "collaboration" / "api-contracts.md").is_file())
@@ -169,6 +170,7 @@ class InitializationTests(VTeamTestCase):
         required_fragments = [
             "无法确定 `agent-id`",
             "Plan/agents/<agent-id>/AGENT.md",
+            "Plan/onboarding.md",
             "用户批准",
             "测试通过",
             "禁止自行推送远程",
@@ -214,6 +216,68 @@ class AgentRegistrationTests(VTeamTestCase):
         self.assertIn("Plan/collaboration/api-contracts.md", rules)
         self.assertIn("一次性授权", rules)
         self.assertTrue((agent_root / "PLAN.md").is_file())
+
+    def test_register_agent_records_user_scope_statement(self) -> None:
+        """description: 输入用户语义范围；输出团队事实和个人规则均保留原始范围。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+
+        result = self.run_cli(
+            "agent",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "user-frontend-001",
+            "--runtime",
+            "codex",
+            "--role",
+            "frontend",
+            "--responsibility",
+            "用户端前端开发",
+            "--scope",
+            "整个用户端前端代码",
+            "--module",
+            "apps/user-web",
+            "--allow",
+            "apps/user-web/",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        agent = self.read_team()["agents"][0]
+        self.assertEqual("整个用户端前端代码", agent["scope_statement"])
+        rules = (
+            self.project_root / "Plan" / "agents" / "user-frontend-001" / "AGENT.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("用户授权范围", rules)
+        self.assertIn("整个用户端前端代码", rules)
+
+    def test_register_agent_allows_inferred_project_wide_scope(self) -> None:
+        """description: 输入完整项目职责；输出允许以点号登记完整项目模块与白名单。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+
+        result = self.run_cli(
+            "agent",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "project-owner-001",
+            "--runtime",
+            "codex",
+            "--role",
+            "project-owner",
+            "--responsibility",
+            "项目级开发",
+            "--scope",
+            "整个项目",
+            "--module",
+            ".",
+            "--allow",
+            ".",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        agent = self.read_team()["agents"][0]
+        self.assertEqual(["."], agent["modules"])
+        self.assertEqual(["."], agent["write_whitelist"])
 
     def test_register_agent_updates_runtime_root_files(self) -> None:
         """description: 输入新增 Claude Agent；输出追加 Claude 运行端并生成对应根入口。"""
@@ -775,7 +839,7 @@ class SkillContractTests(VTeamTestCase):
         """description: 输入技能正文；输出明确身份、个人规则和用户审批三道实现门禁。"""
         content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
         required_fragments = [
-            "身份不明确时停止并询问用户",
+            "身份不明确时按 `Plan/onboarding.md` 快速入职",
             "Plan/agents/<agent-id>/AGENT.md",
             "强制读取",
             "waiting-approval",
@@ -867,6 +931,19 @@ class SkillContractTests(VTeamTestCase):
 
         self.assertIn("- Review: `pending`", template)
         self.assertIn("- Blockers: `-`", template)
+
+    def test_quick_onboarding_template_supports_large_semantic_scopes(self) -> None:
+        """description: 输入快速入职模板；输出支持将用户语义范围映射为完整工作范围。"""
+        template_path = REPOSITORY_ROOT / "references" / "quick-onboarding-template.md"
+        self.assertTrue(template_path.is_file())
+        template = template_path.read_text(encoding="utf-8")
+
+        self.assertIn("身份和业务/项目范围", template)
+        self.assertIn("不要为了最小权限而过度拆分目录", template)
+        self.assertIn("--module .", template)
+        self.assertIn("--allow .", template)
+        self.assertIn("Plan/team.json", template)
+        self.assertIn("自动生成", template)
 
     def test_openai_interface_matches_new_skill(self) -> None:
         """description: 输入 agents/openai.yaml；输出为新技能展示信息和显式技能调用提示。"""
