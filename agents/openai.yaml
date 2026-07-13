@@ -1,4 +1,4 @@
 interface:
-  display_name: "Project Harness Lite"
-  short_description: "Versioned solo or multi-agent project workflow"
-  default_prompt: "Use this skill to manage project-local Plan documents by demand version, run either a multi-agent team or a solo Codex operator rotating through product, architect, backend, frontend, tester, optional devops, and manager roles, enforce a fixed pre-implementation review gate that is revised in place until approved, keep compact living status, verify reality, refresh reports/gaps/memory, archive checkpoints, and allocate next steps."
+  display_name: "V-Team Project Collaboration"
+  short_description: "Codex/Claude 多 Agent 项目协作、计划与模块边界约束"
+  default_prompt: "Use $project-harness-lite to initialize project-local multi-agent roles, ownership boundaries, and an approval-gated development plan."

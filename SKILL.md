@@ -1,237 +1,184 @@
 ---
 name: project-harness-lite
-description: Lightweight per-project engineering harness for coordinating multiple Codex agents or one solo Codex operator rotating through product, architect, frontend, backend, tester, optional devops, and manager roles by demand version. Use when a project needs isolated Plan/ management, versioned work such as v1/v2, role-based solo or multi-agent execution, agent identity files, multi-role status tracking, manager verification against project reality, product reports, archives, project memory, handoff, and next-round task allocation without cross-project memory.
+description: Use when a Codex or Claude project needs multi-agent collaboration, distinct roles, module ownership boundaries, shared current-state contracts, or recoverable project-local planning across independent agent sessions.
 ---
 
 # Project Harness Lite
 
-Use this skill to run a small project-local engineering organization inside a repository. Each boss demand is split into product/engineering versions such as `v1` and `v2`; each Codex thread can act as a named agent inside the active version, or one solo Codex operator can rotate through role cards such as `solo-product`, `solo-architect`, `solo-backend`, `solo-frontend`, `solo-tester`, optional `solo-devops`, and `solo-manager`. Execution roles implement work and keep their own compact status current; the manager role verifies reality before reporting, archiving, remembering, and assigning the next cycle.
+## 概述
 
-## Core Rules
+在一个项目目录内组织 Codex、Claude 或混合 Agent 团队。使用 `Plan/team.json` 保存身份和永久白名单事实，使用项目根约束与个人 `AGENT.md` 强制行为边界，使用单份活动 `PLAN.md` 保持审批、测试、本地提交和恢复进度可追踪。
 
-1. Keep all management state inside the current project root under `Plan/`.
-2. Never merge memory between projects.
-3. Treat `Plan/versions/<version>/agents/<agent-id>.md` as the source for one agent thread in that version.
-4. Support multiple agents with the same role, such as `backend-1`, `backend-2`, and `backend-3`.
-5. Execution agents implement work and update their own agent file; they do not write global project reports.
-6. Manager agents do not claim completion from status text alone; they inspect project reality and label evidence.
-7. Manager agents write only manager artifacts: verification reports, product reports, archives, memory, and next-step plans.
-8. Do not create a new work file for every dialogue. Keep one version folder active until product scope or acceptance criteria changes enough to justify a new version.
-9. Treat planning files as living documents. Update or rewrite the current plan when reality changes instead of appending every conversation.
-10. Preserve original demand meaning, but allow product plans, role plans, corrections, and next steps to be directly revised.
-11. In solo mode, one Codex operator may rotate through multiple role cards, but each work segment must name the active role and update that role's own agent card before switching.
-12. Treat `devops` as optional until build, environment, deployment, release, script, or CI work becomes part of the current version.
-13. Before implementation, run the version's pre-implementation review gate in `Plan/versions/<version>/reviews/current-requirement-review.md`.
-14. Do not create a new review file for each rejection or re-review. Revise the current review file in place until it is approved.
-15. Development starts only after the manager or architect marks the current review gate as approved.
+核心原则：先确认身份和计划，再实现；默认遵守模块归属，同时允许跨模块；只在本地提交前检查一次范围；协作文档只保留当前有效事实。
 
-## Project Layout
+## 项目结构
 
-Use this layout in each project:
+初始化后使用固定结构：
 
 ```text
-Plan/
-  demands/
-    demand-001.md
-  versions/
-    v1/
-      work.md
-      agents/
-      roles/
-      reviews/current-requirement-review.md
-      reports/current-product-report.md
-      verification/current-verification.md
-      next-steps/current-team-plan.md
-      archive/
-      handoff/
-    v2/
-      work.md
-      ...
-  memory/
-    project-memory.md
+<project-root>/
+  AGENTS.md                         # 存在 Codex Agent 时生成
+  CLAUDE.md                         # 存在 Claude Agent 时生成
+  Plan/
+    project.md
+    team.json
+    agents/
+      <agent-id>/
+        AGENT.md
+        PLAN.md
+    collaboration/
+      architecture.md
+      api-contracts.md
+      handoffs.md
+    archive/
 ```
 
-Use `demands/` for the original boss/user demand. Use `versions/v1`, `versions/v2`, etc. for product planning and implementation cycles. A version can contain many dialogue updates and many manager cycles.
+不创建项目版本目录。每个 Agent 只维护 `Plan/agents/<agent-id>/PLAN.md` 这一份活动计划。
 
-## Quick Start
+## 强制工作流
 
-Initialize a project:
+### 1. 初始化项目
+
+根据实际运行端选择命令：
 
 ```bash
-python <path-to-this-skill>/scripts/init_project.py --project-root <project-root> --demand-id demand-001 --version v1
+python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime codex
+python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime claude
+python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime codex --runtime claude
 ```
 
-Initialize a one-person development team:
+`codex` 生成 `AGENTS.md`，`claude` 生成 `CLAUDE.md`，混合团队同时生成两个入口。重复初始化只补充运行端和缺失的当前态文档，不覆盖已有项目进度。
+
+### 2. 注册 Agent
+
+让用户明确指定 Agent ID、运行端、角色、职责、负责模块、永久写入白名单和需要读取的协作文档：
 
 ```bash
-python <path-to-this-skill>/scripts/init_project.py --project-root <project-root> --demand-id demand-001 --version v1 --team-mode solo --solo-owner account-or-person
+python <skill-root>/scripts/vteam.py agent \
+  --project-root <project-root> \
+  --agent-id backend-1 \
+  --runtime codex \
+  --role backend \
+  --responsibility "用户与权限后端" \
+  --module backend/auth \
+  --allow backend/auth/ \
+  --allow tests/auth/ \
+  --read-doc Plan/collaboration/api-contracts.md
 ```
 
-Include an active DevOps role only when the project needs build/deploy/environment ownership:
+同一角色可以注册多个不同 ID。`Plan/team.json` 是身份、运行端和白名单的机器事实源；重新生成个人约束时以它为准。
+
+### 3. 确认身份并读取最小上下文
+
+严格执行以下顺序：
+
+1. 从用户指令或当前任务上下文确认 `agent-id`；身份不明确时停止并询问用户。
+2. 读取项目根 `AGENTS.md` 或 `CLAUDE.md`。
+3. 强制读取 `Plan/agents/<agent-id>/AGENT.md`；文件缺失时停止并要求先注册身份。
+4. 读取自己的 `PLAN.md` 和 `Plan/project.md`。
+5. 只读取个人规则点名且与当前任务直接相关的协作文档。
+6. 默认忽略归档、其他 Agent 历史，以及状态为 `completed` 或 `abandoned` 的计划。
+
+### 4. 编写单份计划并等待审批
+
+直接覆盖或修订自己的 `PLAN.md` 当前内容，不为新对话、新需求或普通修复复制新文件。
+
+计划必须记录：
+
+- 当前目标、用户需求、范围、非目标和预计修改路径。
+- 验收标准、风险、review 结论和协作依赖。
+- 用户批准状态和批准记录。
+- 功能任务、测试结果、本地提交哈希和一次性授权记录。
+- 当前阻塞、下一步和整体完成结论。
+
+每个任务项只能是可独立验收的完整功能或可独立验证的明确功能修复，并适合形成一次语义完整的本地提交。不要把创建文件、新增方法或改一行配置单独拆成任务，除非它本身就是完整交付。
+
+计划状态使用 `draft`、`waiting-approval`、`in-progress`、`completed`、`abandoned`。完成 review 后设为 `waiting-approval`；用户批准前禁止实现代码。批准后改为 `in-progress`，每次只执行一个未完成任务。
+
+### 5. 实现、测试和本地提交
+
+每个功能任务按以下顺序执行：
+
+1. 实现计划内的完整功能或明确修复。
+2. 运行足以证明该功能正确的测试；测试不需要扩展到无关复杂场景。
+3. 测试失败时停止提交，记录失败原因，任务保持未完成。
+4. 测试通过后暂存当前任务需要提交的文件。
+5. 只在本地提交前统一检查一次：
 
 ```bash
-python <path-to-this-skill>/scripts/init_project.py --project-root <project-root> --demand-id demand-001 --version v1 --team-mode solo --include-devops
+python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> --agent-id <agent-id>
 ```
 
-Register a Codex thread as an agent:
+该命令内部只调用一次 `git diff --name-only HEAD`。退出码 `0` 表示范围通过，`2` 表示存在白名单外路径，`1` 表示配置或 Git 错误。
+
+范围通过后使用中文完成本地 Git 提交。禁止自行推送远程，禁止自行合并。本技能不创建、切换、命名或管理 Git 分支。
+
+提交成功后立即在 `PLAN.md` 把任务标记为完成，记录测试结果和本地提交哈希。提交失败时不得填写哈希或标记完成。
+
+## 边界与跨模块协作
+
+白名单表示“无需再次询问即可提交”的默认边界，不限制读取和理解其他模块。Agent 优先处理自己的模块，但允许跨模块修改，前提是能确认调用关系、影响范围和测试方式。
+
+发现白名单外路径时：
+
+1. 暂停当前本地提交。
+2. 向用户列出越界路径、修改原因、影响模块和建议提交说明。
+3. 询问用户是否允许当前提交。
+4. 用户同意后，在当前 `PLAN.md` 记录一次性授权，再提交本次变更。
+5. 一次性授权只对当前提交有效，不得修改 `Plan/team.json` 扩大永久白名单。
+6. 用户拒绝时，不得提交越界路径；拆分、撤销或交给更合适的 Agent。
+
+简单的一次性跨模块修改只走上述授权流程，不强制创建 handoff。
+
+## 当前态协作文档
+
+只在产物会长期被其他 Agent 消费，或接口、数据结构、模块边界、运行方式、后续集成责任发生变化时维护协作文档：
+
+| 文档 | 当前职责 |
+|---|---|
+| `Plan/collaboration/architecture.md` | 当前有效模块边界、调用关系、数据流和技术约束 |
+| `Plan/collaboration/api-contracts.md` | 当前有效接口、字段、错误约定、示例和集成结果 |
+| `Plan/collaboration/handoffs.md` | 仍未完成的跨 Agent 交付物、接收者和验收条件 |
+
+需求澄清、接口变化和进度变化优先覆盖或修订原有段落。不要把协作文档写成聊天记录，也不要为普通新任务重复介绍全部对接历史。对接验证完成或取消后从活动 `handoffs.md` 移除，精简摘要进入归档。
+
+## 安全清理
+
+只对状态为 `completed` 或 `abandoned` 的计划运行：
 
 ```bash
-python <path-to-this-skill>/scripts/register_agent.py --project-root <project-root> --version v1 --agent-id backend-2 --role backend --responsibility "user permission module"
+python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --agent-id <agent-id>
 ```
 
-Update compact status after execution work:
+正常完成计划必须满足：至少一个功能任务；全部任务已完成；每项有测试结果和 7 至 40 位本地提交哈希；相关 handoff 已关闭或转移。废弃计划必须记录非空放弃原因，已完成任务仍保留测试与提交证据。
 
-```bash
-python <path-to-this-skill>/scripts/update_agent_status.py --project-root <project-root> --version v1 --agent-id backend-2 --done "Implemented permission API" --changed backend/src/auth.py --next "Add integration test"
-```
+清理先把计划快照和已关闭对接摘要写入 `Plan/archive/`，再把活动 `PLAN.md` 重置为空白草稿并移除活动 handoff 中的 `completed`、`cancelled` 项。活动计划或当前 Agent 参与的开放 handoff 必须拒绝清理。
 
-Update the fixed pre-implementation review file:
+## 错误门禁
 
-```bash
-python <path-to-this-skill>/scripts/update_review.py --project-root <project-root> --version v1 --reviewer architect --status in-review --backend-analysis "API boundary is feasible but error codes need definition" --frontend-analysis "UI flow depends on login state contract"
-```
+| 情况 | 必须执行 |
+|---|---|
+| 无法确认 Agent ID | 停止并询问用户 |
+| `team.json` 缺失或无效 | 停止并指出具体字段 |
+| 个人 `AGENT.md` 缺失 | 先注册或重新生成身份 |
+| 计划未批准 | 禁止实现代码 |
+| 测试失败 | 禁止提交并记录失败原因 |
+| 存在越界路径 | 请求当前提交的一次性授权 |
+| 本地提交失败 | 不得标记任务完成 |
+| 存在开放对接 | 保持 handoff 活动，不推断完成 |
+| 计划仍活动 | 禁止清理 |
 
-Approve the review gate after rework passes:
+## 资源
 
-```bash
-python <path-to-this-skill>/scripts/update_review.py --project-root <project-root> --version v1 --reviewer architect --status approved --decision-result approved --decision-note "Requirement review passed; implementation can start"
-```
+- `scripts/vteam.py`：`init`、`agent`、`check-scope`、`cleanup` 统一入口。
+- `references/root-agents-template.md`：Codex 项目根约束模板。
+- `references/root-claude-template.md`：Claude 项目根约束模板。
+- `references/personal-agent-template.md`：个人身份、边界和行为模板。
+- `references/plan-template.md`：唯一活动计划模板。
+- `references/project-template.md`：项目当前态模板。
+- `references/architecture-template.md`：架构当前态模板。
+- `references/api-contracts-template.md`：接口契约当前态模板。
+- `references/handoffs-template.md`：开放对接当前态模板。
+- `references/team-template.json`：团队配置初始结构。
 
-Run one manager cycle:
-
-```bash
-python <path-to-this-skill>/scripts/run_manager_cycle.py --project-root <project-root> --version v1
-```
-
-Start a new version only when the product plan meaningfully changes:
-
-```bash
-python <path-to-this-skill>/scripts/init_project.py --project-root <project-root> --demand-id demand-001 --version v2
-```
-
-## Agent Workflow
-
-When assigned to a non-manager role:
-
-1. Register the agent if `Plan/versions/<version>/agents/<agent-id>.md` is missing.
-2. Read `Plan/demands/<demand-id>.md`, `Plan/versions/<version>/work.md`, `Plan/versions/<version>/reviews/current-requirement-review.md`, and own versioned agent file.
-3. Implement the assigned feature in the project.
-4. Update only the own agent file with completed work, changed files, blockers, needs, and next suggestions.
-5. Include concrete file paths and test/build evidence whenever possible.
-6. Keep the agent file as a current summary. Do not store every dialogue turn.
-7. Use `--mode replace` when a prior claim is wrong, rejected, or superseded by a new plan.
-
-## Solo Dev Team Workflow
-
-Use solo mode when one person/account wants Codex to behave like a coordinated development team rather than a single undifferentiated assistant.
-
-1. Start with `solo-product` to clarify the demand, product intent, non-goals, and acceptance criteria.
-2. Rotate to `solo-architect` to define architecture, module boundaries, technical risks, and integration contracts.
-3. Fill the pre-implementation review file with product, architect, backend, frontend, and tester analyses.
-4. Let `solo-manager` or `solo-architect` chair the review meeting and mark issues directly in the same review file.
-5. If the review is rejected or changes are requested, revise the same review file in place; do not create `review-2`, `review-final`, or another replacement file.
-6. After the review is approved, rotate to `solo-backend` and `solo-frontend` for implementation. Use both when the feature crosses API/UI boundaries; use only the relevant role for narrow work.
-7. Rotate to `solo-tester` to create and run verification, regression checks, and acceptance review.
-8. Rotate to `solo-devops` only when build, environment, deployment, release, script, or CI work is in scope.
-9. Finish the cycle as `solo-manager`: inspect project reality, run the manager cycle, refresh report/next steps/memory, and assign the next role.
-
-Before switching roles or Codex accounts:
-
-- Update the current role's agent card with completed work, changed files, evidence, blockers, handoff, and next suggestions.
-- Record the next intended role in `Handoff`.
-- If the next account has no conversation context, tell it to read `Plan/versions/<version>/work.md`, `Plan/versions/<version>/agents/`, `Plan/versions/<version>/next-steps/current-team-plan.md`, and `Plan/memory/project-memory.md` before acting.
-
-Suggested solo role ids:
-
-- `solo-product`: user value, requirements, acceptance criteria, non-goals.
-- `solo-architect`: architecture, boundaries, contracts, technical risk.
-- `solo-backend`: domain logic, APIs, data, backend tests.
-- `solo-frontend`: UI, interaction, state, frontend integration, visual quality.
-- `solo-tester`: test plan, verification, regression, evidence.
-- `solo-devops`: optional build/deploy/environment/release owner.
-- `solo-manager`: reality check, report, memory, next-step allocation.
-
-## Manager Workflow
-
-When assigned to `manager`:
-
-1. Read `Plan/demands/`, `Plan/versions/<version>/work.md`, `Plan/versions/<version>/reviews/current-requirement-review.md`, `Plan/versions/<version>/agents/`, `Plan/versions/<version>/roles/`, and `Plan/memory/`.
-2. Inspect project reality before summarizing:
-   - check claimed changed files exist
-   - inspect relevant code or docs for claimed outputs
-   - use visible test/build results when present
-   - mark missing evidence explicitly
-3. Rewrite `Plan/versions/<version>/verification/current-verification.md`.
-4. Rewrite `Plan/versions/<version>/reports/current-product-report.md`.
-5. Rewrite `Plan/versions/<version>/next-steps/current-team-plan.md`.
-6. Append `Plan/versions/<version>/archive/project-archive.md`.
-7. Append durable decisions, unresolved risks, and stable constraints to `Plan/memory/project-memory.md`.
-8. When task gaps are found, directly rewrite the `Active Gaps` and `Manager Corrections` sections in `Plan/versions/<version>/work.md`.
-9. In solo mode, do not trust a claim just because the same operator made it in another role; verify file paths, tests, and visible implementation evidence exactly as with a multi-agent team.
-10. If the review gate is not approved, assign review correction tasks before implementation tasks.
-
-## Pre-Implementation Review Gate
-
-Use `Plan/versions/<version>/reviews/current-requirement-review.md` as the single living review file for one version.
-
-Required flow:
-
-1. Product role writes demand analysis, user value, non-goals, and acceptance criteria.
-2. Architect role writes architecture impact, module boundaries, contracts, and risk points.
-3. Backend role writes backend feasibility, API/data/domain changes, and backend risks.
-4. Frontend role writes UI flow, state, integration dependencies, and frontend risks.
-5. Tester role writes acceptance checks, regression scope, and evidence needed.
-6. Manager or architect chairs the review meeting and records issues in `Review Issues`.
-7. If the user, manager, or architect rejects part of the plan, edit the same file: update the relevant role analysis, issue status, decision, and revision log.
-8. Repeat the review meeting in the same file until `Status: approved`, `Result: approved`, and `Implementation allowed: yes`.
-9. Start development only after approval.
-
-The review file is a living document. Preserve the current truth, not every dialogue turn. Keep durable changes in `Revision Log`; use `archive` only for milestone summaries, not for every review edit.
-
-## Living Document Rules
-
-Use rewrite vs append like a real project team:
-
-- Rewrite current plan sections when requirements are clarified, rejected, corrected, or reprioritized.
-- Rewrite current agent summaries when the latest state supersedes old status.
-- Rewrite current review sections when requirement analysis, review issues, or decisions are rejected and corrected.
-- Append only durable checkpoints: new boss demand, new version, verified milestone, unresolved risk, important decision, or release note.
-- Add a new version only when the product plan or acceptance criteria changes meaningfully.
-- Add a new feature node inside the current version when scope expands but the version goal remains the same.
-- Add a new fix/correction node when verification finds a gap; do not create a new task file for every fix.
-- Keep `archive` and `memory` concise. They should preserve decisions and evidence, not full conversation history.
-
-## Evidence Labels
-
-Use these labels in manager outputs:
-
-- `Verified`: claim has project evidence, such as changed file existence, tests, or direct implementation evidence.
-- `Unverified`: claim is plausible but evidence is missing or not inspected.
-- `Mismatch`: claim conflicts with project files or work requirements.
-- `Blocked`: claim identifies a blocker or dependency that prevents completion.
-- `Planned`: role or agent is registered but has not made a completion or progress claim yet.
-
-## Manager Reality Check
-
-The manager must avoid hallucination by writing uncertainty directly:
-
-- If an agent says "done" but no changed files or test evidence exists, mark it `Unverified`.
-- If a claimed file does not exist, mark it `Mismatch`.
-- If work requirements are not traceable to an implementation or handoff, assign a correction task.
-- If tests were not run, do not imply they passed.
-- If the manager infers anything, label it as an assumption.
-
-## Resources
-
-- `scripts/init_project.py`: create project-local `Plan/` directories and seed files; use `--team-mode solo` to pre-create solo role cards and `--include-devops` when DevOps should be active.
-- `scripts/register_agent.py`: create a named agent identity file.
-- `scripts/update_agent_status.py`: rewrite compact current status in an agent file.
-- `scripts/update_review.py`: rewrite the fixed pre-implementation review file in place; use it for role analyses, review meeting notes, issues, corrections, and approval.
-- `scripts/run_manager_cycle.py`: rewrite current verification/report/plan, refresh work gaps, and append concise archive/memory checkpoints.
-- [`references/agent-card-template.md`](references/agent-card-template.md): agent identity/status format.
-- [`references/work-template.md`](references/work-template.md): work definition format.
-- [`references/review-template.md`](references/review-template.md): pre-implementation review format.
-- [`references/product-report-template.md`](references/product-report-template.md): manager product report format.
-- [`references/next-steps-template.md`](references/next-steps-template.md): next-cycle assignment format.
-- [`references/verification-template.md`](references/verification-template.md): reality-check report format.
-- [`references/memory-rules.md`](references/memory-rules.md): project-local memory rules.
+所有脚本只依赖 Python 3 标准库和 Git，使用 `pathlib`、参数数组形式的 Git 子进程、UTF-8 文件与 Git 风格相对路径，兼容 Windows 和 macOS。

@@ -622,5 +622,118 @@ class CleanupTests(VTeamTestCase):
         self.assertEqual("旧归档\n", first_archive.read_text(encoding="utf-8"))
 
 
+class SkillContractTests(VTeamTestCase):
+    """description: 验证技能触发信息、强制工作流、资源清理和技能库索引保持一致。"""
+
+    def test_skill_description_matches_multi_agent_project_workflow(self) -> None:
+        """description: 输入技能 frontmatter；输出为只描述触发条件的多 Agent 项目协作说明。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        description_line = next(
+            line for line in content.splitlines() if line.startswith("description:")
+        )
+
+        self.assertTrue(description_line.startswith("description: Use when"))
+        for keyword in ["Codex", "Claude", "multi-agent", "module ownership"]:
+            self.assertIn(keyword, description_line)
+        self.assertNotIn("versioned", description_line.lower())
+        self.assertLessEqual(len(content.splitlines()), 500)
+
+    def test_skill_requires_identity_personal_agent_and_plan_approval(self) -> None:
+        """description: 输入技能正文；输出明确身份、个人规则和用户审批三道实现门禁。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required_fragments = [
+            "身份不明确时停止并询问用户",
+            "Plan/agents/<agent-id>/AGENT.md",
+            "强制读取",
+            "waiting-approval",
+            "用户批准前禁止实现代码",
+        ]
+        for fragment in required_fragments:
+            self.assertIn(fragment, content)
+
+    def test_skill_documents_single_pre_commit_scope_check(self) -> None:
+        """description: 输入技能正文；输出只在本地提交前执行一次固定差异检查。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("只在本地提交前统一检查一次", content)
+        self.assertIn("git diff --name-only HEAD", content)
+        self.assertNotIn("每次修改文件前", content)
+        self.assertNotIn("Git Hook", content)
+
+    def test_skill_allows_user_approved_cross_module_commit(self) -> None:
+        """description: 输入技能正文；输出允许跨模块工作并要求本次提交的一次性用户授权。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("允许跨模块", content)
+        self.assertIn("一次性授权", content)
+        self.assertIn("当前提交", content)
+        self.assertIn("不得修改 `Plan/team.json`", content)
+
+    def test_skill_forbids_remote_push_and_self_merge_without_managing_branches(self) -> None:
+        """description: 输入技能正文；输出禁止远程推送合并且不包含分支管理流程。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        self.assertIn("禁止自行推送远程", content)
+        self.assertIn("禁止自行合并", content)
+        self.assertIn("不创建、切换、命名或管理 Git 分支", content)
+        self.assertNotIn("branch naming", content.lower())
+
+    def test_skill_documents_living_collaboration_and_cleanup_rules(self) -> None:
+        """description: 输入技能正文；输出为三份当前态协作文档和安全归档清理规则。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        required_fragments = [
+            "Plan/collaboration/architecture.md",
+            "Plan/collaboration/api-contracts.md",
+            "Plan/collaboration/handoffs.md",
+            "覆盖或修订",
+            "completed",
+            "abandoned",
+            "Plan/archive/",
+            "默认忽略归档",
+        ]
+        for fragment in required_fragments:
+            self.assertIn(fragment, content)
+
+    def test_old_scripts_and_version_templates_are_removed(self) -> None:
+        """description: 输入重构后的技能目录；输出只保留统一入口和新当前态模板。"""
+        old_paths = [
+            "scripts/init_project.py",
+            "scripts/register_agent.py",
+            "scripts/run_manager_cycle.py",
+            "scripts/update_agent_status.py",
+            "scripts/update_review.py",
+            "references/agent-card-template.md",
+            "references/memory-rules.md",
+            "references/next-steps-template.md",
+            "references/product-report-template.md",
+            "references/review-template.md",
+            "references/verification-template.md",
+            "references/work-template.md",
+        ]
+        for relative_path in old_paths:
+            self.assertFalse((REPOSITORY_ROOT / relative_path).exists(), relative_path)
+        self.assertTrue((REPOSITORY_ROOT / "scripts" / "vteam.py").is_file())
+
+    def test_repository_readme_documents_cross_platform_usage(self) -> None:
+        """description: 输入仓库说明；输出包含新用途和跨平台命令，不依赖仓库外路径。"""
+        repository_readme_path = REPOSITORY_ROOT / "README.md"
+        self.assertTrue(repository_readme_path.is_file(), "仓库缺少 README.md")
+        repository_readme = repository_readme_path.read_text(encoding="utf-8")
+
+        for fragment in ["Windows", "macOS", "scripts/vteam.py", "check-scope", "cleanup"]:
+            self.assertIn(fragment, repository_readme)
+
+    def test_openai_interface_matches_new_skill(self) -> None:
+        """description: 输入 agents/openai.yaml；输出为新技能展示信息和显式技能调用提示。"""
+        content = (REPOSITORY_ROOT / "agents" / "openai.yaml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('display_name: "V-Team Project Collaboration"', content)
+        self.assertIn("$project-harness-lite", content)
+        self.assertNotIn("version", content.lower())
+        self.assertNotIn("manager cycle", content.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
