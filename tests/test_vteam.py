@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import locale
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "vteam.py"
+
+
+def load_vteam_module() -> types.ModuleType:
+    """description: 动态加载统一入口模块；输入为固定脚本路径；输出为可直接测试的模块对象。"""
+    specification = importlib.util.spec_from_file_location("vteam_under_test", SCRIPT_PATH)
+    if specification is None or specification.loader is None:
+        raise RuntimeError(f"无法加载测试模块: {SCRIPT_PATH}")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
 
 
 class VTeamTestCase(unittest.TestCase):
@@ -80,6 +93,31 @@ class VTeamTestCase(unittest.TestCase):
         """description: 读取临时项目的团队配置；输入为 project_root；输出为解析后的 JSON 对象。"""
         team_path = self.project_root / "Plan" / "team.json"
         return json.loads(team_path.read_text(encoding="utf-8"))
+
+    def run_git(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        """description: 在临时项目运行 Git；输入为 Git 参数；输出为包含退出码与文本的完成结果。"""
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=self.project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    def initialize_git_repository(self) -> None:
+        """description: 把当前临时项目初始化为含基线提交的 Git 仓库；输入为 project_root；输出为空。"""
+        commands = [
+            ("init",),
+            ("config", "user.name", "V-Team Test"),
+            ("config", "user.email", "vteam-test@example.com"),
+            ("config", "commit.gpgsign", "false"),
+            ("add", "."),
+            ("commit", "-m", "初始化测试项目"),
+        ]
+        for arguments in commands:
+            result = self.run_git(*arguments)
+            self.assertEqual(0, result.returncode, result.stderr)
 
 
 class InitializationTests(VTeamTestCase):
@@ -207,6 +245,172 @@ class AgentRegistrationTests(VTeamTestCase):
 
         self.assertEqual(1, result.returncode)
         self.assertIn("agents", result.stderr)
+
+
+class ScopeCheckTests(VTeamTestCase):
+    """description: 验证提交前单次 Git 差异读取、路径规范化和白名单越界报告。"""
+
+    def test_paths_inside_whitelist_pass(self) -> None:
+        """description: 输入白名单内暂存文件；输出范围检查通过且退出码为 0。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.initialize_git_repository()
+        target_path = self.project_root / "backend" / "auth" / "service.py"
+        target_path.parent.mkdir(parents=True)
+        target_path.write_text("VALUE = 1\n", encoding="utf-8")
+        self.assertEqual(0, self.run_git("add", ".").returncode)
+
+        result = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("范围检查通过", result.stdout)
+
+    def test_paths_outside_whitelist_are_reported(self) -> None:
+        """description: 输入白名单内外混合暂存文件；输出只列出越界路径并返回 2。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.initialize_git_repository()
+        allowed_path = self.project_root / "backend" / "auth" / "service.py"
+        denied_path = self.project_root / "frontend" / "login.ts"
+        allowed_path.parent.mkdir(parents=True)
+        denied_path.parent.mkdir(parents=True)
+        allowed_path.write_text("VALUE = 1\n", encoding="utf-8")
+        denied_path.write_text("export const login = true;\n", encoding="utf-8")
+        self.assertEqual(0, self.run_git("add", ".").returncode)
+
+        result = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertIn("frontend/login.ts", output)
+        self.assertNotIn("backend/auth/service.py", output)
+        self.assertIn("一次性授权", output)
+        self.assertIn("不会扩大永久白名单", output)
+
+    def test_backslashes_spaces_and_non_ascii_paths_are_normalized(self) -> None:
+        """description: 输入反斜杠、空格和中文路径；输出为规范 Git 相对路径并可匹配目录规则。"""
+        module = load_vteam_module()
+        normalize = getattr(module, "normalize_relative_path", None)
+        matcher = getattr(module, "path_is_allowed", None)
+        self.assertIsNotNone(normalize, "缺少 normalize_relative_path")
+        self.assertIsNotNone(matcher, "缺少 path_is_allowed")
+
+        normalized = normalize(".\\后端\\用户 模块\\服务.py")
+
+        self.assertEqual("后端/用户 模块/服务.py", normalized)
+        self.assertTrue(matcher(normalized, ["后端/用户 模块/"]))
+
+    def test_case_insensitive_matching_can_model_windows(self) -> None:
+        """description: 输入大小写不同的 Windows 模拟路径；输出为允许匹配。"""
+        module = load_vteam_module()
+        matcher = getattr(module, "path_is_allowed", None)
+        self.assertIsNotNone(matcher, "缺少 path_is_allowed")
+
+        self.assertTrue(
+            matcher("Backend/API.py", ["backend/"], case_sensitive=False)
+        )
+        self.assertFalse(
+            matcher("Backend/API.py", ["backend/"], case_sensitive=True)
+        )
+
+    def test_exact_directory_and_glob_rules_have_distinct_semantics(self) -> None:
+        """description: 输入精确文件、目录和 glob；输出遵循各自匹配语义。"""
+        module = load_vteam_module()
+        matcher = getattr(module, "path_is_allowed", None)
+        self.assertIsNotNone(matcher, "缺少 path_is_allowed")
+
+        self.assertTrue(matcher("README.md", ["README.md"]))
+        self.assertFalse(matcher("docs/README.md", ["README.md"]))
+        self.assertTrue(matcher("backend/auth/service.py", ["backend/"]))
+        self.assertTrue(matcher("backend/auth/service.py", ["backend/**"]))
+        self.assertTrue(matcher("frontend/login.ts", ["frontend/*.ts"]))
+        self.assertFalse(matcher("frontend/nested/login.ts", ["frontend/*.ts"]))
+        self.assertTrue(matcher("any/path.txt", ["."]))
+
+    def test_path_escape_and_absolute_paths_are_rejected(self) -> None:
+        """description: 输入路径逃逸和绝对路径；输出为 ValueError。"""
+        module = load_vteam_module()
+        normalize = getattr(module, "normalize_relative_path", None)
+        self.assertIsNotNone(normalize, "缺少 normalize_relative_path")
+
+        invalid_paths = ["../secret.txt", "C:\\secret.txt", "/tmp/secret.txt"]
+        for invalid_path in invalid_paths:
+            with self.assertRaises(ValueError):
+                normalize(invalid_path)
+
+    def test_git_quoted_utf8_path_is_decoded(self) -> None:
+        """description: 输入 Git C 风格八进制中文路径；输出为真实 UTF-8 相对路径。"""
+        module = load_vteam_module()
+        decoder = getattr(module, "decode_git_path", None)
+        self.assertIsNotNone(decoder, "缺少 decode_git_path")
+
+        decoded = decoder('"docs/\\346\\226\\207\\346\\241\\243.md"')
+
+        self.assertEqual("docs/文档.md", decoded)
+
+    def test_one_time_approval_is_never_persisted_to_team_json(self) -> None:
+        """description: 输入越界检查；输出只报告授权流程且团队配置字节保持不变。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.initialize_git_repository()
+        team_path = self.project_root / "Plan" / "team.json"
+        before_content = team_path.read_bytes()
+        denied_path = self.project_root / "frontend" / "越界 文件.ts"
+        denied_path.parent.mkdir(parents=True)
+        denied_path.write_text("export const value = 1;\n", encoding="utf-8")
+        self.assertEqual(0, self.run_git("add", ".").returncode)
+
+        result = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertIn("frontend/", output)
+        self.assertIn("一次性授权", output)
+        self.assertEqual(before_content, team_path.read_bytes())
+        self.assertNotIn("approval", team_path.read_text(encoding="utf-8"))
+
+    def test_git_diff_uses_name_only_head_once(self) -> None:
+        """description: 输入项目路径；输出只调用一次固定参数数组的 Git 差异命令。"""
+        module = load_vteam_module()
+        collector = getattr(module, "collect_git_changes", None)
+        self.assertIsNotNone(collector, "缺少 collect_git_changes")
+        completed = subprocess.CompletedProcess(
+            args=["git", "diff", "--name-only", "HEAD"],
+            returncode=0,
+            stdout="backend/auth/service.py\n",
+            stderr="",
+        )
+
+        with mock.patch.object(module.subprocess, "run", return_value=completed) as runner:
+            paths = collector(self.project_root)
+
+        self.assertEqual(["backend/auth/service.py"], paths)
+        runner.assert_called_once_with(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=self.project_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

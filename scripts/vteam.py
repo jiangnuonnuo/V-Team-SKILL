@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -94,14 +96,14 @@ def normalize_runtime_values(runtimes: Sequence[str]) -> list[str]:
     return normalized
 
 
-def normalize_config_path(raw_path: str) -> str:
-    """description: 把配置路径转换为安全的 Git 风格项目相对路径。
+def normalize_relative_path(raw_path: str) -> str:
+    """description: 把输入路径转换为安全的 Git 风格项目相对路径。
 
     Args:
-        raw_path: 用户提供的模块、白名单或协作文档路径。
+        raw_path: Git 返回或用户提供的项目相对路径。
 
     Returns:
-        使用正斜杠的项目相对路径，并保留目录结尾斜杠。
+        使用正斜杠的项目相对路径；根规则返回点号，目录保留结尾斜杠。
 
     Raises:
         ValueError: 路径为空、为绝对路径、包含盘符或尝试逃逸项目根目录。
@@ -111,6 +113,9 @@ def normalize_config_path(raw_path: str) -> str:
         raise ValueError("配置路径不能为空")
     if path_text.startswith("/") or re.match(r"^[A-Za-z]:", path_text):
         raise ValueError(f"配置路径必须是项目相对路径: {raw_path}")
+
+    if path_text in {".", "./"}:
+        return "."
 
     keep_trailing_slash = path_text.endswith("/")
     segments: list[str] = []
@@ -128,6 +133,238 @@ def normalize_config_path(raw_path: str) -> str:
     if keep_trailing_slash:
         normalized += "/"
     return normalized
+
+
+def normalize_config_path(raw_path: str) -> str:
+    """description: 规范化 team.json 中的模块、白名单或协作文档路径。
+
+    Args:
+        raw_path: 用户提供的项目相对路径或白名单规则。
+
+    Returns:
+        安全的 Git 风格项目相对路径。
+
+    Raises:
+        ValueError: 路径为空、为绝对路径、包含盘符或尝试路径逃逸。
+    """
+    return normalize_relative_path(raw_path)
+
+
+def decode_git_path(raw_path: str) -> str:
+    """description: 解码 Git 默认输出中的 C 风格引号与八进制 UTF-8 字节。
+
+    Args:
+        raw_path: `git diff --name-only HEAD` 输出的一行路径。
+
+    Returns:
+        可直接规范化和匹配的 Unicode 路径。
+
+    Raises:
+        ValueError: 引号路径包含无效转义或字节不是合法 UTF-8。
+    """
+    if not raw_path.startswith('"') or not raw_path.endswith('"'):
+        return raw_path
+
+    content = raw_path[1:-1]
+    decoded_bytes = bytearray()
+    simple_escapes = {
+        "a": 7,
+        "b": 8,
+        "t": 9,
+        "n": 10,
+        "v": 11,
+        "f": 12,
+        "r": 13,
+        '"': 34,
+        "\\": 92,
+    }
+
+    index = 0
+    while index < len(content):
+        character = content[index]
+        if character != "\\":
+            decoded_bytes.extend(character.encode("utf-8"))
+            index += 1
+            continue
+
+        index += 1
+        if index >= len(content):
+            raise ValueError(f"Git 路径包含不完整转义: {raw_path}")
+
+        escaped = content[index]
+        if escaped in simple_escapes:
+            decoded_bytes.append(simple_escapes[escaped])
+            index += 1
+            continue
+
+        if escaped in "01234567":
+            octal_digits = escaped
+            index += 1
+            while index < len(content) and len(octal_digits) < 3:
+                if content[index] not in "01234567":
+                    break
+                octal_digits += content[index]
+                index += 1
+            decoded_bytes.append(int(octal_digits, 8))
+            continue
+
+        decoded_bytes.extend(escaped.encode("utf-8"))
+        index += 1
+
+    try:
+        return decoded_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"Git 路径不是有效 UTF-8: {raw_path}") from error
+
+
+def glob_to_regex(pattern: str) -> str:
+    """description: 把有限 Git 风格 glob 转换为不会跨错目录层级的正则表达式。
+
+    Args:
+        pattern: 已规范化且包含星号或问号的白名单规则。
+
+    Returns:
+        可用于整串匹配的正则表达式文本。
+
+    Raises:
+        无。
+    """
+    parts: list[str] = ["^"]
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                parts.append(".*")
+                index += 2
+            else:
+                parts.append("[^/]*")
+                index += 1
+            continue
+        if character == "?":
+            parts.append("[^/]")
+            index += 1
+            continue
+        parts.append(re.escape(character))
+        index += 1
+    parts.append("$")
+    return "".join(parts)
+
+
+def path_is_allowed(
+    path: str,
+    patterns: Sequence[str],
+    case_sensitive: bool | None = None,
+) -> bool:
+    """description: 判断单个 Git 变更路径是否属于 Agent 永久白名单。
+
+    Args:
+        path: 需要检查的项目相对路径。
+        patterns: 精确文件、结尾斜杠目录、glob 或点号根规则列表。
+        case_sensitive: 显式大小写策略；为空时 Windows 不敏感，其他系统敏感。
+
+    Returns:
+        任一规则匹配时返回 True，否则返回 False。
+
+    Raises:
+        ValueError: 变更路径或白名单规则不是安全的项目相对路径。
+    """
+    normalized_path = normalize_relative_path(path)
+    use_case_sensitive = os.name != "nt" if case_sensitive is None else case_sensitive
+    comparable_path = normalized_path if use_case_sensitive else normalized_path.casefold()
+
+    for raw_pattern in patterns:
+        normalized_pattern = normalize_relative_path(raw_pattern)
+        comparable_pattern = (
+            normalized_pattern
+            if use_case_sensitive
+            else normalized_pattern.casefold()
+        )
+
+        if comparable_pattern == ".":
+            return True
+        if comparable_pattern.endswith("/"):
+            if comparable_path.startswith(comparable_pattern):
+                return True
+            continue
+        if "*" in comparable_pattern or "?" in comparable_pattern:
+            if re.fullmatch(glob_to_regex(comparable_pattern), comparable_path):
+                return True
+            continue
+        if comparable_path == comparable_pattern:
+            return True
+
+    return False
+
+
+def collect_git_changes(project_root: Path) -> list[str]:
+    """description: 统一读取当前本地提交相对 HEAD 涉及的全部路径。
+
+    Args:
+        project_root: 已初始化 Git 仓库的项目根目录。
+
+    Returns:
+        已解码、规范化并去除空行的变更路径列表。
+
+    Raises:
+        RuntimeError: Git 命令失败。
+        ValueError: Git 返回不安全或不可解码的路径。
+        OSError: Git 无法启动。
+    """
+    result = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        error_message = result.stderr.strip() or "git diff 执行失败"
+        raise RuntimeError(error_message)
+
+    changed_paths: list[str] = []
+    for output_line in result.stdout.splitlines():
+        if not output_line.strip():
+            continue
+        decoded_path = decode_git_path(output_line.strip())
+        changed_paths.append(normalize_relative_path(decoded_path))
+    return changed_paths
+
+
+def check_scope(project_root: Path, agent_id: str) -> list[str]:
+    """description: 检查一次当前 Git 变更是否全部属于指定 Agent 白名单。
+
+    Args:
+        project_root: 包含 Git 仓库和 Plan/team.json 的项目根目录。
+        agent_id: 需要执行本地提交的 Agent ID。
+
+    Returns:
+        不在永久白名单内的全部变更路径。
+
+    Raises:
+        ValueError: Agent ID 不存在或配置、路径无效。
+        RuntimeError: Git 差异读取失败。
+        OSError: 配置或 Git 读取失败。
+    """
+    normalized_agent_id = validate_agent_id(agent_id)
+    team = load_team(project_root)
+
+    matching_agent: dict[str, object] | None = None
+    for agent in team["agents"]:
+        if agent["id"] == normalized_agent_id:
+            matching_agent = agent
+            break
+    if matching_agent is None:
+        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
+
+    changed_paths = collect_git_changes(project_root)
+    whitelist = matching_agent["write_whitelist"]
+    return [
+        path
+        for path in changed_paths
+        if not path_is_allowed(path, whitelist)
+    ]
 
 
 def validate_agent_id(agent_id: str) -> str:
@@ -480,7 +717,7 @@ def build_parser() -> argparse.ArgumentParser:
         无。
 
     Returns:
-        包含 init 与 agent 子命令的 ArgumentParser。
+        包含 init、agent 与 check-scope 子命令的 ArgumentParser。
 
     Raises:
         无。
@@ -512,6 +749,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument("--module", action="append", default=[])
     agent_parser.add_argument("--allow", action="append", required=True)
     agent_parser.add_argument("--read-doc", action="append", default=[])
+
+    scope_parser = subparsers.add_parser(
+        "check-scope",
+        help="本地提交前统一检查一次变更路径",
+    )
+    scope_parser.add_argument("--project-root", required=True, type=Path)
+    scope_parser.add_argument("--agent-id", required=True)
     return parser
 
 
@@ -549,7 +793,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print(f"Agent 已更新: {arguments.agent_id}")
             return 0
-    except (FileNotFoundError, OSError, ValueError) as error:
+
+        if arguments.command == "check-scope":
+            violations = check_scope(
+                project_root=arguments.project_root,
+                agent_id=arguments.agent_id,
+            )
+            if not violations:
+                print(f"范围检查通过: {arguments.agent_id}")
+                return 0
+
+            print(f"发现白名单外路径，Agent: {arguments.agent_id}", file=sys.stderr)
+            for violation in violations:
+                print(f"- {violation}", file=sys.stderr)
+            print(
+                "暂停当前本地提交；请向用户说明修改原因和影响，并询问是否允许本次提交。",
+                file=sys.stderr,
+            )
+            print(
+                "用户同意后只在当前 PLAN.md 记录一次性授权；该授权不会扩大永久白名单。",
+                file=sys.stderr,
+            )
+            return 2
+    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
 
