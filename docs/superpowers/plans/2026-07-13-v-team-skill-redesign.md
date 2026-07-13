@@ -351,7 +351,7 @@ git commit -m "功能：支持完成计划安全归档清理"
 - Delete: `references/verification-template.md`
 - Delete: `references/work-template.md`
 
-- [ ] **实现并验证“技能交付契约与旧结构清理”完整功能，形成一次中文本地提交**
+- [x] **实现并验证“技能交付契约与旧结构清理”完整功能，形成一次中文本地提交**
 
 先在 `tests/test_vteam.py` 新增静态契约测试：
 
@@ -438,6 +438,6 @@ git commit -m "重构：完成多Agent协作开发技能"
 | Task 1 初始化与 Agent 注册 | completed | 9 项测试通过；`py_compile` 通过 | `1c25eb4` | Windows 子进程输出按平台编码验证，生成文件保持 UTF-8 |
 | Task 2 提交范围检查 | completed | 9 项功能测试、18 项累计回归通过 | `59a6bc0` | 只运行一次 `git diff --name-only HEAD`；授权不落永久配置 |
 | Task 3 计划归档与清理 | completed | 7 项功能测试、25 项累计回归通过 | `7c34f5b` | 归档优先；活动计划与开放对接均阻止清理 |
-| Task 4 技能契约与旧结构清理 | pending | - | - | - |
+| Task 4 技能契约与旧结构清理 | completed | `quick_validate` 通过；35 项全量测试通过；4 个子命令帮助通过 | `7d01c1c` | 自审修复 `25fb5fe`；父技能库索引已更新，父目录无 Git 仓库 |
 
-**整体状态:** `in-progress`
+**整体状态:** `completed`
