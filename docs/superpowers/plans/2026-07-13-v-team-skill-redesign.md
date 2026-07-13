@@ -91,7 +91,7 @@ python scripts/vteam.py cleanup --project-root <path> --agent-id <id>
 - Create: `references/handoffs-template.md`
 - Create: `references/team-template.json`
 
-- [ ] **实现并验证“初始化与 Agent 注册”完整功能，形成一次中文本地提交**
+- [x] **实现并验证“初始化与 Agent 注册”完整功能，形成一次中文本地提交**
 
 测试先行，先在 `tests/test_vteam.py` 建立 `VTeamTestCase`。每个测试使用 `tempfile.TemporaryDirectory()`，通过 `importlib.util.spec_from_file_location` 加载 `scripts/vteam.py`，不写入真实用户项目。至少实现以下测试：
 
@@ -435,7 +435,7 @@ git commit -m "重构：完成多Agent协作开发技能"
 
 | 功能任务 | 状态 | 测试结果 | 本地提交 | 备注 |
 |---|---|---|---|---|
-| Task 1 初始化与 Agent 注册 | pending | - | - | - |
+| Task 1 初始化与 Agent 注册 | completed | 9 项测试通过；`py_compile` 通过 | `1c25eb4` | Windows 子进程输出按平台编码验证，生成文件保持 UTF-8 |
 | Task 2 提交范围检查 | pending | - | - | - |
 | Task 3 计划归档与清理 | pending | - | - | - |
 | Task 4 技能契约与旧结构清理 | pending | - | - | - |
