@@ -604,6 +604,26 @@ class CleanupTests(VTeamTestCase):
         self.assertIn("H1", result.stderr)
         self.assertEqual(original_plan, self.plan_path.read_text(encoding="utf-8"))
 
+    def test_unknown_handoff_status_blocks_cleanup(self) -> None:
+        """description: 输入未知 handoff 状态；输出拒绝清理，避免把不完整契约推断为关闭。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+        )
+        handoffs = (
+            "# 当前跨 Agent 对接\n\n"
+            "| ID | 提出者 | 接收者 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|\n"
+            "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | waiting |\n"
+        )
+        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+
+        result = self.run_cleanup()
+
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("未知状态", result.stderr)
+        self.assertIn("H1", self.handoffs_path.read_text(encoding="utf-8"))
+
     def test_archive_name_collision_creates_deterministic_suffix(self) -> None:
         """description: 输入已存在的同日归档；输出新归档使用 -2 且不覆盖旧文件。"""
         self.write_plan(
@@ -722,6 +742,7 @@ class SkillContractTests(VTeamTestCase):
 
         for fragment in ["Windows", "macOS", "scripts/vteam.py", "check-scope", "cleanup"]:
             self.assertIn(fragment, repository_readme)
+        self.assertIn("Python 3.10", repository_readme)
 
     def test_openai_interface_matches_new_skill(self) -> None:
         """description: 输入 agents/openai.yaml；输出为新技能展示信息和显式技能调用提示。"""

@@ -576,8 +576,13 @@ def validate_cleanup_state(
         if commit_pattern.fullmatch(task["commit"]) is None:
             raise ValueError(f"已完成任务 {task['id']} 缺少有效本地提交哈希")
 
+    valid_handoff_statuses = {"open", "in-progress", "completed", "cancelled"}
     active_statuses = {"open", "in-progress"}
     for handoff in parse_handoff_rows(handoffs_text):
+        if handoff["status"] not in valid_handoff_statuses:
+            raise ValueError(
+                f"对接 {handoff['id']} 使用未知状态: {handoff['status']}"
+            )
         involves_agent = agent_id in {
             handoff["proposer"],
             handoff["receiver"],
