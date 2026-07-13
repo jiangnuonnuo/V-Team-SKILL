@@ -51,7 +51,7 @@ python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtim
 
 ### 2. 注册 Agent
 
-让用户明确指定 Agent ID、运行端、角色、职责、负责模块、永久写入白名单和需要读取的协作文档：
+让用户明确指定 Agent ID、运行端、角色、职责、至少一个负责模块、永久写入白名单和需要读取的协作文档：
 
 ```bash
 python <skill-root>/scripts/vteam.py agent \
@@ -86,14 +86,20 @@ python <skill-root>/scripts/vteam.py agent \
 计划必须记录：
 
 - 当前目标、用户需求、范围、非目标和预计修改路径。
-- 验收标准、风险、review 结论和协作依赖。
+- 验收标准、风险、review 记录和协作依赖。
 - 用户批准状态和批准记录。
 - 功能任务、测试结果、本地提交哈希和一次性授权记录。
 - 当前阻塞、下一步和整体完成结论。
 
 每个任务项只能是可独立验收的完整功能或可独立验证的明确功能修复，并适合形成一次语义完整的本地提交。不要把创建文件、新增方法或改一行配置单独拆成任务，除非它本身就是完整交付。
 
-计划状态使用 `draft`、`waiting-approval`、`in-progress`、`completed`、`abandoned`。完成 review 后设为 `waiting-approval`；用户批准前禁止实现代码。批准后改为 `in-progress`，每次只执行一个未完成任务。
+Review 只审查当前 `PLAN.md` 的需求、范围、模块归属、验收标准、风险和测试计划。记录 `Reviewer`、`Scope`、`Review`、`Blockers`、`Tests` 与 `Required changes`；`Review` 为 `pass`、所有必填项已填写且 `Blockers`、`Required changes` 均为 `none` 或 `无` 后运行：
+
+```bash
+python <skill-root>/scripts/vteam.py check-plan --project-root <project-root> --agent-id <agent-id>
+```
+
+通过后才可设为 `waiting-approval`。用户批准前禁止实现代码。跨模块、接口、安全或数据迁移任务在提交前增加一次代码 review；审查人只读取当前 diff 与任务测试结果，阻塞项未清零不得提交。
 
 ### 5. 实现、测试和本地提交
 
@@ -113,7 +119,7 @@ python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> -
 
 范围通过后使用中文完成本地 Git 提交。禁止自行推送远程，禁止自行合并。本技能不创建、切换、命名或管理 Git 分支。
 
-提交成功后立即在 `PLAN.md` 把任务标记为完成，记录测试结果和本地提交哈希。提交失败时不得填写哈希或标记完成。
+提交成功后立即在 `PLAN.md` 把任务标记为完成，记录测试命令与结果和本地提交哈希。提交失败时不得填写哈希或标记完成。
 
 ## 边界与跨模块协作
 
@@ -150,7 +156,7 @@ python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> -
 python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --agent-id <agent-id>
 ```
 
-正常完成计划必须满足：至少一个功能任务；全部任务已完成；每项有测试结果和 7 至 40 位本地提交哈希；相关 handoff 已关闭或转移。废弃计划必须记录非空放弃原因，已完成任务仍保留测试与提交证据。
+正常完成计划必须满足：计划 review 已通过；至少一个功能任务；全部任务已完成；每项有测试结果和 7 至 40 位、可由 Git 解析为 commit 的本地提交哈希；相关 handoff 已关闭或转移。废弃计划必须记录非空放弃原因，已完成任务仍保留测试与提交证据。
 
 清理先把计划快照和已关闭对接摘要写入 `Plan/archive/`，再把活动 `PLAN.md` 重置为空白草稿并移除活动 handoff 中的 `completed`、`cancelled` 项。活动计划或当前 Agent 参与的开放 handoff 必须拒绝清理。
 
@@ -161,6 +167,7 @@ python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --age
 | 无法确认 Agent ID | 停止并询问用户 |
 | `team.json` 缺失或无效 | 停止并指出具体字段 |
 | 个人 `AGENT.md` 缺失 | 先注册或重新生成身份 |
+| review 未通过或有阻塞项 | 修订计划并重新执行 `check-plan` |
 | 计划未批准 | 禁止实现代码 |
 | 测试失败 | 禁止提交并记录失败原因 |
 | 存在越界路径 | 请求当前提交的一次性授权 |
@@ -170,7 +177,7 @@ python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --age
 
 ## 资源
 
-- `scripts/vteam.py`：`init`、`agent`、`check-scope`、`cleanup` 统一入口。
+- `scripts/vteam.py`：`init`、`agent`、`check-plan`、`check-scope`、`cleanup` 统一入口。
 - `references/root-agents-template.md`：Codex 项目根约束模板。
 - `references/root-claude-template.md`：Claude 项目根约束模板。
 - `references/personal-agent-template.md`：个人身份、边界和行为模板。

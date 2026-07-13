@@ -247,6 +247,96 @@ class AgentRegistrationTests(VTeamTestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("agents", result.stderr)
 
+    def test_register_agent_requires_at_least_one_module(self) -> None:
+        """description: 输入缺少模块的 Agent 注册命令；输出参数错误，避免无归属身份。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+
+        result = self.run_cli(
+            "agent",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+            "--runtime",
+            "codex",
+            "--role",
+            "backend",
+            "--responsibility",
+            "用户与权限模块",
+            "--allow",
+            "backend/auth/",
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("--module", result.stderr)
+
+
+class PlanCheckTests(VTeamTestCase):
+    """description: 验证计划 review 通过和阻塞项的轻量门禁。"""
+
+    def setUp(self) -> None:
+        """description: 初始化包含一名 Agent 的项目；输入为 unittest 生命周期；输出为可校验计划。"""
+        super().setUp()
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+
+    @property
+    def plan_path(self) -> Path:
+        """description: 获取 backend-1 活动计划路径；输入为项目根目录；输出为 PLAN.md 路径。"""
+        return self.project_root / "Plan" / "agents" / "backend-1" / "PLAN.md"
+
+    def write_review(self, review: str, blockers: str) -> None:
+        """description: 写入最小 review 记录；输入为结论与阻塞项；输出为可供 check-plan 解析的计划。"""
+        self.plan_path.write_text(
+            "# backend-1 活动计划\n\n"
+            "- Agent ID: `backend-1`\n"
+            "- Status: `draft`\n"
+            "- Approval: `pending`\n\n"
+            "## Review 与批准记录\n\n"
+            "- Reviewer: `reviewer-1`\n"
+            "- Scope: `PLAN.md`\n"
+            f"- Review: `{review}`\n"
+            f"- Blockers: `{blockers}`\n\n"
+            "- Tests: `python -m unittest tests/test_vteam.py`\n"
+            "- Required changes: `none`\n\n"
+            "## 功能任务\n\n"
+            "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |\n"
+            "|---|---|---|---|---|\n\n"
+            "## 放弃原因\n\n"
+            "- 无。\n",
+            encoding="utf-8",
+        )
+
+    def test_check_plan_accepts_passing_review_without_blockers(self) -> None:
+        """description: 输入 pass 和 none；输出 review 门禁通过。"""
+        self.write_review("pass", "none")
+
+        result = self.run_cli(
+            "check-plan",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("Review 检查通过", result.stdout)
+
+    def test_check_plan_rejects_blocking_review(self) -> None:
+        """description: 输入 block 与阻塞项；输出拒绝进入审批等待状态。"""
+        self.write_review("block", "缺少权限回滚验收标准")
+
+        result = self.run_cli(
+            "check-plan",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("review", result.stderr.lower())
+
 
 class ScopeCheckTests(VTeamTestCase):
     """description: 验证提交前单次 Git 差异读取、路径规范化和白名单越界报告。"""
@@ -422,6 +512,10 @@ class CleanupTests(VTeamTestCase):
         super().setUp()
         self.assertEqual(0, self.initialize("codex").returncode)
         self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.initialize_git_repository()
+        commit_result = self.run_git("rev-parse", "HEAD")
+        self.assertEqual(0, commit_result.returncode, commit_result.stderr)
+        self.commit_hash = commit_result.stdout.strip()
 
     @property
     def plan_path(self) -> Path:
@@ -452,6 +546,13 @@ class CleanupTests(VTeamTestCase):
             f"- Approval: `{approval}`\n\n"
             "## 当前目标\n\n"
             "完成权限功能。\n\n"
+            "## Review 与批准记录\n\n"
+            "- Reviewer: `reviewer-1`\n"
+            "- Scope: `PLAN.md`\n"
+            "- Review: `pass`\n"
+            "- Blockers: `none`\n"
+            "- Tests: `python -m unittest tests/test_vteam.py`\n"
+            "- Required changes: `none`\n\n"
             "## 功能任务\n\n"
             "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |\n"
             "|---|---|---|---|---|\n"
@@ -471,7 +572,7 @@ class CleanupTests(VTeamTestCase):
     ) -> None:
         """description: 写入清理测试计划；输入为计划字段；输出为空。"""
         content = self.build_plan(status, task_rows, reason, approval)
-        self.plan_path.write_text(content, encoding="utf-8", newline="\n")
+        self.plan_path.write_text(content, encoding="utf-8")
 
     def run_cleanup(self) -> subprocess.CompletedProcess[str]:
         """description: 运行 backend-1 清理命令；输入为固定身份；输出为 CLI 完成结果。"""
@@ -503,9 +604,9 @@ class CleanupTests(VTeamTestCase):
         """description: 输入完成证据缺失的计划；输出拒绝并指出证据问题。"""
         invalid_cases = [
             ("缺少任务", []),
-            ("缺少测试", [("T1", "权限功能", "completed", "-", "abcdef1")]),
+            ("缺少测试", [("T1", "权限功能", "completed", "-", self.commit_hash)]),
             ("缺少提交", [("T1", "权限功能", "completed", "OK", "-")]),
-            ("任务未完成", [("T1", "权限功能", "pending", "OK", "abcdef1")]),
+            ("任务未完成", [("T1", "权限功能", "pending", "OK", self.commit_hash)]),
         ]
         for label, task_rows in invalid_cases:
             with self.subTest(label=label):
@@ -537,7 +638,7 @@ class CleanupTests(VTeamTestCase):
         """description: 输入证据完整的完成计划；输出保留快照并重置为空白草稿。"""
         self.write_plan(
             "completed",
-            [("T1", "完成权限功能", "completed", "9 tests OK", "abcdef1")],
+            [("T1", "完成权限功能", "completed", "9 tests OK", self.commit_hash)],
         )
 
         result = self.run_cleanup()
@@ -548,7 +649,7 @@ class CleanupTests(VTeamTestCase):
         archive_content = archive_files[0].read_text(encoding="utf-8")
         self.assertIn("完成权限功能", archive_content)
         self.assertIn("9 tests OK", archive_content)
-        self.assertIn("abcdef1", archive_content)
+        self.assertIn(self.commit_hash, archive_content)
         active_content = self.plan_path.read_text(encoding="utf-8")
         self.assertIn("- Status: `draft`", active_content)
         self.assertIn("当前无活动任务", active_content)
@@ -558,7 +659,7 @@ class CleanupTests(VTeamTestCase):
         """description: 输入已关闭和无关开放 handoff；输出关闭项归档移除且开放项保留。"""
         self.write_plan(
             "completed",
-            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+            [("T1", "完成接口", "completed", "API test OK", self.commit_hash)],
         )
         handoffs = (
             "# 当前跨 Agent 对接\n\n"
@@ -568,7 +669,7 @@ class CleanupTests(VTeamTestCase):
             "| H2 | backend-1 | tester-1 | 旧方案 | 无 | cancelled |\n"
             "| H3 | data-1 | report-1 | 报表 | 页面可见 | open |\n"
         )
-        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+        self.handoffs_path.write_text(handoffs, encoding="utf-8")
 
         result = self.run_cleanup()
 
@@ -587,7 +688,7 @@ class CleanupTests(VTeamTestCase):
         """description: 输入当前 Agent 参与的开放 handoff；输出拒绝完成计划清理。"""
         self.write_plan(
             "completed",
-            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+            [("T1", "完成接口", "completed", "API test OK", self.commit_hash)],
         )
         handoffs = (
             "# 当前跨 Agent 对接\n\n"
@@ -595,7 +696,7 @@ class CleanupTests(VTeamTestCase):
             "|---|---|---|---|---|---|\n"
             "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | open |\n"
         )
-        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+        self.handoffs_path.write_text(handoffs, encoding="utf-8")
         original_plan = self.plan_path.read_text(encoding="utf-8")
 
         result = self.run_cleanup()
@@ -608,7 +709,7 @@ class CleanupTests(VTeamTestCase):
         """description: 输入未知 handoff 状态；输出拒绝清理，避免把不完整契约推断为关闭。"""
         self.write_plan(
             "completed",
-            [("T1", "完成接口", "completed", "API test OK", "1234567")],
+            [("T1", "完成接口", "completed", "API test OK", self.commit_hash)],
         )
         handoffs = (
             "# 当前跨 Agent 对接\n\n"
@@ -616,7 +717,7 @@ class CleanupTests(VTeamTestCase):
             "|---|---|---|---|---|---|\n"
             "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | waiting |\n"
         )
-        self.handoffs_path.write_text(handoffs, encoding="utf-8", newline="\n")
+        self.handoffs_path.write_text(handoffs, encoding="utf-8")
 
         result = self.run_cleanup()
 
@@ -628,7 +729,7 @@ class CleanupTests(VTeamTestCase):
         """description: 输入已存在的同日归档；输出新归档使用 -2 且不覆盖旧文件。"""
         self.write_plan(
             "completed",
-            [("T1", "完成权限功能", "completed", "OK", "abcdef1")],
+            [("T1", "完成权限功能", "completed", "OK", self.commit_hash)],
         )
         archive_root = self.project_root / "Plan" / "archive"
         first_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan.md"
@@ -640,6 +741,18 @@ class CleanupTests(VTeamTestCase):
         second_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan-2.md"
         self.assertTrue(second_archive.is_file())
         self.assertEqual("旧归档\n", first_archive.read_text(encoding="utf-8"))
+
+    def test_completed_plan_rejects_unknown_commit(self) -> None:
+        """description: 输入格式正确但不存在的提交哈希；输出拒绝伪造完成证据。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成权限功能", "completed", "OK", "abcdef1")],
+        )
+
+        result = self.run_cleanup()
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("提交不存在", result.stderr)
 
 
 class SkillContractTests(VTeamTestCase):
@@ -667,6 +780,8 @@ class SkillContractTests(VTeamTestCase):
             "强制读取",
             "waiting-approval",
             "用户批准前禁止实现代码",
+            "check-plan",
+            "`Review` 为 `pass`",
         ]
         for fragment in required_fragments:
             self.assertIn(fragment, content)
@@ -740,9 +855,18 @@ class SkillContractTests(VTeamTestCase):
         self.assertTrue(repository_readme_path.is_file(), "仓库缺少 README.md")
         repository_readme = repository_readme_path.read_text(encoding="utf-8")
 
-        for fragment in ["Windows", "macOS", "scripts/vteam.py", "check-scope", "cleanup"]:
+        for fragment in ["Windows", "macOS", "scripts/vteam.py", "check-plan", "check-scope", "cleanup"]:
             self.assertIn(fragment, repository_readme)
-        self.assertIn("Python 3.10", repository_readme)
+        self.assertIn("Python 3.9", repository_readme)
+
+    def test_plan_template_defines_machine_checkable_review_fields(self) -> None:
+        """description: 输入计划模板；输出固定 review 结论和阻塞项字段。"""
+        template = (REPOSITORY_ROOT / "references" / "plan-template.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("- Review: `pending`", template)
+        self.assertIn("- Blockers: `-`", template)
 
     def test_openai_interface_matches_new_skill(self) -> None:
         """description: 输入 agents/openai.yaml；输出为新技能展示信息和显式技能调用提示。"""

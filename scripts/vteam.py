@@ -38,7 +38,8 @@ def write_text(path: Path, content: str, overwrite: bool = True) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     normalized_content = content.rstrip() + "\n"
-    path.write_text(normalized_content, encoding="utf-8", newline="\n")
+    with path.open("w", encoding="utf-8", newline="\n") as output_file:
+        output_file.write(normalized_content)
 
 
 def render_template(template_name: str, values: dict[str, str]) -> str:
@@ -449,6 +450,25 @@ def read_plan_state(plan_path: Path) -> dict[str, object]:
     if approval_match is None:
         raise ValueError("PLAN.md 缺少 `- Approval: `<status>`` 元数据")
 
+    review_matches: dict[str, re.Match[str] | None] = {
+        "review": re.search(r"^- Review:\s*`([^`]+)`\s*$", content, re.MULTILINE),
+        "blockers": re.search(r"^- Blockers:\s*`([^`]+)`\s*$", content, re.MULTILINE),
+        "reviewer": re.search(r"^- Reviewer:\s*`([^`]+)`\s*$", content, re.MULTILINE),
+        "scope": re.search(r"^- Scope:\s*`([^`]+)`\s*$", content, re.MULTILINE),
+        "review_tests": re.search(r"^- Tests:\s*`([^`]+)`\s*$", content, re.MULTILINE),
+        "required_changes": re.search(
+            r"^- Required changes:\s*`([^`]+)`\s*$",
+            content,
+            re.MULTILINE,
+        ),
+    }
+    missing_review_fields = [
+        name for name, match in review_matches.items() if match is None
+    ]
+    if missing_review_fields:
+        fields = ", ".join(missing_review_fields)
+        raise ValueError(f"PLAN.md 缺少 review 记录: {fields}")
+
     task_heading = "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |"
     if task_heading not in content:
         raise ValueError("PLAN.md 缺少固定功能任务表头")
@@ -486,6 +506,12 @@ def read_plan_state(plan_path: Path) -> dict[str, object]:
         "content": content,
         "status": status_match.group(1).strip(),
         "approval": approval_match.group(1).strip(),
+        "review": review_matches["review"].group(1).strip(),
+        "blockers": review_matches["blockers"].group(1).strip(),
+        "reviewer": review_matches["reviewer"].group(1).strip(),
+        "scope": review_matches["scope"].group(1).strip(),
+        "review_tests": review_matches["review_tests"].group(1).strip(),
+        "required_changes": review_matches["required_changes"].group(1).strip(),
         "tasks": tasks,
         "abandoned_reason": abandoned_reason,
     }
@@ -529,6 +555,7 @@ def validate_cleanup_state(
     plan_state: dict[str, object],
     handoffs_text: str,
     agent_id: str,
+    project_root: Path,
 ) -> None:
     """description: 校验计划状态、完成证据和跨 Agent 依赖满足清理条件。
 
@@ -553,6 +580,7 @@ def validate_cleanup_state(
     if status == "completed":
         if plan_state["approval"] != "approved":
             raise ValueError("completed 计划缺少 approved 用户审批记录")
+        validate_review_state(plan_state)
         if not tasks:
             raise ValueError("completed 计划至少需要一个完整功能或明确修复任务")
         unfinished_task_ids = [
@@ -575,6 +603,8 @@ def validate_cleanup_state(
             raise ValueError(f"已完成任务 {task['id']} 缺少测试结果")
         if commit_pattern.fullmatch(task["commit"]) is None:
             raise ValueError(f"已完成任务 {task['id']} 缺少有效本地提交哈希")
+        if not local_commit_exists(project_root, task["commit"]):
+            raise ValueError(f"已完成任务 {task['id']} 的本地提交不存在: {task['commit']}")
 
     valid_handoff_statuses = {"open", "in-progress", "completed", "cancelled"}
     active_statuses = {"open", "in-progress"}
@@ -591,6 +621,63 @@ def validate_cleanup_state(
             raise ValueError(
                 f"存在当前 Agent 参与的未关闭对接 {handoff['id']}: {handoff['status']}"
             )
+
+
+def review_value_is_empty(value: str) -> bool:
+    """description: 判断 review 固定字段是否仍为未填写占位值。"""
+    return value.strip().casefold() in {"", "-", "pending", "待补充", "待补充。"}
+
+
+def review_value_means_none(value: str) -> bool:
+    """description: 判断 review 问题字段是否明确表示没有待处理项。"""
+    normalized = value.strip().casefold().rstrip(".。")
+    return normalized in {"none", "无"}
+
+
+def validate_review_state(plan_state: dict[str, object]) -> None:
+    """description: 校验计划 review 已通过且没有待处理修改。"""
+    required_fields = {
+        "Reviewer": str(plan_state["reviewer"]),
+        "Scope": str(plan_state["scope"]),
+        "Tests": str(plan_state["review_tests"]),
+    }
+    empty_fields = [
+        name for name, value in required_fields.items() if review_value_is_empty(value)
+    ]
+    if empty_fields:
+        raise ValueError(f"review 缺少必填记录: {', '.join(empty_fields)}")
+    if str(plan_state["review"]).casefold() != "pass":
+        raise ValueError("review 尚未通过，不能进入后续流程")
+    if not review_value_means_none(str(plan_state["blockers"])):
+        raise ValueError("review 仍有阻塞项，不能进入后续流程")
+    if not review_value_means_none(str(plan_state["required_changes"])):
+        raise ValueError("review 仍有待修改项，不能进入后续流程")
+
+
+def local_commit_exists(project_root: Path, commit_hash: str) -> bool:
+    """description: 验证计划记录的本地提交哈希解析为真实 Git commit 对象。"""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{commit_hash}^{{commit}}"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return result.returncode == 0
+
+
+def check_plan(project_root: Path, agent_id: str) -> None:
+    """description: 校验指定 Agent 的计划 review 已满足进入用户审批的条件。"""
+    normalized_agent_id = validate_agent_id(agent_id)
+    team = load_team(project_root)
+    registered_ids = {agent["id"] for agent in team["agents"]}
+    if normalized_agent_id not in registered_ids:
+        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
+
+    plan_path = project_root / "Plan" / "agents" / normalized_agent_id / "PLAN.md"
+    plan_state = read_plan_state(plan_path)
+    validate_review_state(plan_state)
 
 
 def next_archive_path(archive_root: Path, agent_id: str, date_text: str) -> Path:
@@ -681,7 +768,12 @@ def cleanup_agent_plan(project_root: Path, agent_id: str) -> Path:
 
     plan_state = read_plan_state(plan_path)
     handoffs_text = handoffs_path.read_text(encoding="utf-8")
-    validate_cleanup_state(plan_state, handoffs_text, normalized_agent_id)
+    validate_cleanup_state(
+        plan_state,
+        handoffs_text,
+        normalized_agent_id,
+        project_root,
+    )
     active_handoffs, closed_handoffs = remove_closed_handoffs(handoffs_text)
 
     # 先写入新归档，任何后续失败都不会丢失原计划证据。
@@ -1064,7 +1156,7 @@ def build_parser() -> argparse.ArgumentParser:
         无。
 
     Returns:
-        包含 init、agent、check-scope 与 cleanup 子命令的 ArgumentParser。
+        包含 init、agent、check-plan、check-scope 与 cleanup 子命令的 ArgumentParser。
 
     Raises:
         无。
@@ -1093,9 +1185,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     agent_parser.add_argument("--role", required=True)
     agent_parser.add_argument("--responsibility", required=True)
-    agent_parser.add_argument("--module", action="append", default=[])
+    agent_parser.add_argument("--module", action="append", required=True)
     agent_parser.add_argument("--allow", action="append", required=True)
     agent_parser.add_argument("--read-doc", action="append", default=[])
+
+    plan_parser = subparsers.add_parser(
+        "check-plan",
+        help="在用户审批前校验计划 review 门禁",
+    )
+    plan_parser.add_argument("--project-root", required=True, type=Path)
+    plan_parser.add_argument("--agent-id", required=True)
 
     scope_parser = subparsers.add_parser(
         "check-scope",
@@ -1146,6 +1245,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 collaboration_docs=arguments.read_doc,
             )
             print(f"Agent 已更新: {arguments.agent_id}")
+            return 0
+
+        if arguments.command == "check-plan":
+            check_plan(
+                project_root=arguments.project_root,
+                agent_id=arguments.agent_id,
+            )
+            print(f"Review 检查通过: {arguments.agent_id}")
             return 0
 
         if arguments.command == "check-scope":

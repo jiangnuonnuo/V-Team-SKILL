@@ -25,7 +25,12 @@
 
 ## Review 与批准记录
 
-- Review 结论：待补充。
+- Reviewer: `-`
+- Scope: `-`
+- Review: `pending`
+- Blockers: `-`
+- Tests: `-`
+- Required changes: `-`
 - 用户批准：否。
 - 批准记录：无。
 
