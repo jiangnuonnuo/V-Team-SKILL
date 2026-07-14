@@ -945,16 +945,23 @@ class SkillContractTests(VTeamTestCase):
         self.assertIn("Plan/team.json", template)
         self.assertIn("自动生成", template)
 
-    def test_openai_interface_matches_new_skill(self) -> None:
-        """description: 输入 agents/openai.yaml；输出为新技能展示信息和显式技能调用提示。"""
-        content = (REPOSITORY_ROOT / "agents" / "openai.yaml").read_text(
+    def test_skill_identity_is_v_team_across_entrypoints(self) -> None:
+        """description: 输入技能、界面和仓库入口；输出统一的 V-Team 标识与调用名。"""
+        skill_content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        readme_content = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+        ui_content = (REPOSITORY_ROOT / "agents" / "openai.yaml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn('display_name: "V-Team Project Collaboration"', content)
-        self.assertIn("$project-harness-lite", content)
-        self.assertNotIn("version", content.lower())
-        self.assertNotIn("manager cycle", content.lower())
+        self.assertIn("name: v-team", skill_content)
+        self.assertIn("# V-Team", skill_content)
+        self.assertIn("`v-team`", readme_content)
+        self.assertIn('display_name: "V-Team"', ui_content)
+        self.assertIn("$v-team", ui_content)
+        for content in [skill_content, readme_content, ui_content]:
+            self.assertNotIn("project-harness-lite", content)
+        self.assertNotIn("version", ui_content.lower())
+        self.assertNotIn("manager cycle", ui_content.lower())
 
 
 if __name__ == "__main__":

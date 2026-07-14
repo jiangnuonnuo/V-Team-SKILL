@@ -1,9 +1,9 @@
 ---
-name: project-harness-lite
+name: v-team
 description: Use when a Codex or Claude project needs multi-agent collaboration, distinct roles, module ownership boundaries, shared current-state contracts, or recoverable project-local planning across independent agent sessions.
 ---
 
-# Project Harness Lite
+# V-Team
 
 ## 概述
 

@@ -1,4 +1,4 @@
 interface:
-  display_name: "V-Team Project Collaboration"
+  display_name: "V-Team"
   short_description: "Codex/Claude 多 Agent 项目协作、计划与模块边界约束"
-  default_prompt: "Use $project-harness-lite to onboard project-local agents from a user-provided identity and business scope, then set collaboration boundaries and an approval-gated development plan."
+  default_prompt: "Use $v-team to onboard project-local agents from a user-provided identity and business scope, then set collaboration boundaries and an approval-gated development plan."
