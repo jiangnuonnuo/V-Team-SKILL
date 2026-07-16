@@ -859,6 +859,46 @@ class SkillContractTests(VTeamTestCase):
         self.assertNotIn("每次修改文件前", content)
         self.assertNotIn("Git Hook", content)
 
+    def test_skill_documents_risk_based_testing_and_evidence_reuse(self) -> None:
+        """description: 输入技能正文；输出三档测试策略、证据复用和结果导向 Review 规则。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+        for fragment in [
+            "定向验证",
+            "相关完整回归",
+            "全仓回归",
+            "同一代码、依赖和运行配置未变化",
+            "不进行无条件自动重试",
+            "Reviewer 默认审阅当前 diff 和已有测试结果，不重复执行测试",
+        ]:
+            self.assertIn(fragment, content)
+
+    def test_generated_agent_rules_use_risk_based_testing_and_result_review(self) -> None:
+        """description: 输入三类 Agent 规则模板；输出一致的测试等级、证据复用与验收 Review 要求。"""
+        for relative_path in [
+            "references/root-agents-template.md",
+            "references/root-claude-template.md",
+            "references/personal-agent-template.md",
+        ]:
+            content = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+
+            self.assertIn("按风险选择最小有效验证", content)
+            self.assertIn("同一代码、依赖和运行配置未变化", content)
+            self.assertIn("需求、验收标准、改动范围与风险", content)
+
+    def test_plan_template_records_test_level_and_evidence_validity(self) -> None:
+        """description: 输入计划模板；输出测试等级、命令结果和证据有效范围字段。"""
+        content = (REPOSITORY_ROOT / "references" / "plan-template.md").read_text(
+            encoding="utf-8"
+        )
+
+        for fragment in [
+            "- Test level: `pending`",
+            "- Test commands and results: `-`",
+            "- Evidence validity: `-`",
+        ]:
+            self.assertIn(fragment, content)
+
     def test_skill_allows_user_approved_cross_module_commit(self) -> None:
         """description: 输入技能正文；输出允许跨模块工作并要求本次提交的一次性用户授权。"""
         content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")

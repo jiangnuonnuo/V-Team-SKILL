@@ -30,6 +30,9 @@
 - Review: `pending`
 - Blockers: `-`
 - Tests: `-`
+- Test level: `pending`
+- Test commands and results: `-`
+- Evidence validity: `-`
 - Required changes: `-`
 - 用户批准：否。
 - 批准记录：无。
