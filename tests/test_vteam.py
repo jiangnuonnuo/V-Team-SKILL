@@ -10,7 +10,6 @@ import sys
 import tempfile
 import types
 import unittest
-from datetime import date
 from pathlib import Path
 from unittest import mock
 
@@ -87,7 +86,7 @@ class VTeamTestCase(unittest.TestCase):
             "--allow",
             "tests/auth/",
             "--read-doc",
-            "Plan/collaboration/api-contracts.md",
+            "Plan/collaboration/handoffs.md",
         )
 
     def read_team(self) -> dict[str, object]:
@@ -157,9 +156,29 @@ class InitializationTests(VTeamTestCase):
         self.assertTrue((self.project_root / "Plan" / "project.md").is_file())
         self.assertTrue((self.project_root / "Plan" / "onboarding.md").is_file())
         self.assertTrue((self.project_root / "Plan" / "team.json").is_file())
-        self.assertTrue((self.project_root / "Plan" / "collaboration" / "architecture.md").is_file())
-        self.assertTrue((self.project_root / "Plan" / "collaboration" / "api-contracts.md").is_file())
         self.assertTrue((self.project_root / "Plan" / "collaboration" / "handoffs.md").is_file())
+        self.assertTrue((self.project_root / "Plan" / "collaboration" / "active").is_dir())
+        self.assertFalse((self.project_root / "Plan" / "archive").exists())
+
+    def test_init_excludes_plan_from_an_existing_git_repository(self) -> None:
+        """description: 输入已有 Git 仓库；输出本地排除规则防止 Plan 被常规暂存。"""
+        source_path = self.project_root / "backend" / "bootstrap.py"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text("VALUE = 1\n", encoding="utf-8")
+        self.initialize_git_repository()
+
+        result = self.initialize("codex")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(0, self.run_git("add", ".").returncode)
+
+        staged = self.run_git("diff", "--cached", "--name-only")
+        self.assertEqual(0, staged.returncode, staged.stderr)
+        self.assertNotIn("Plan/", staged.stdout)
+        exclude_content = (self.project_root / ".git" / "info" / "exclude").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("# v-team local collaboration artifacts: begin", exclude_content)
+        self.assertIn("/Plan/", exclude_content)
 
     def test_root_rules_contain_required_behavior_gates(self) -> None:
         """description: 输入 Codex 项目；输出根规则包含身份、审批、测试、提交和上下文门禁。"""
@@ -175,9 +194,10 @@ class InitializationTests(VTeamTestCase):
             "测试通过",
             "禁止自行推送远程",
             "禁止自行合并",
-            "Plan/archive/",
+            "Plan/collaboration/handoffs.md",
+            "Plan/collaboration/active/",
             "completed",
-            "abandoned",
+            "cleanup",
         ]
         for fragment in required_fragments:
             self.assertIn(fragment, rules)
@@ -213,7 +233,7 @@ class AgentRegistrationTests(VTeamTestCase):
         self.assertIn("backend-1", rules)
         self.assertIn("用户与权限模块", rules)
         self.assertIn("backend/auth/", rules)
-        self.assertIn("Plan/collaboration/api-contracts.md", rules)
+        self.assertIn("Plan/collaboration/handoffs.md", rules)
         self.assertIn("一次性授权", rules)
         self.assertTrue((agent_root / "PLAN.md").is_file())
 
@@ -454,6 +474,53 @@ class ScopeCheckTests(VTeamTestCase):
         self.assertIn("一次性授权", output)
         self.assertIn("不会扩大永久白名单", output)
 
+    def test_plan_paths_are_rejected_even_for_project_wide_whitelist(self) -> None:
+        """description: 输入被强制暂存的 Plan 文档；输出不可授权的提交拒绝。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "agent",
+                "--project-root",
+                str(self.project_root),
+                "--agent-id",
+                "project-owner-001",
+                "--runtime",
+                "codex",
+                "--role",
+                "project-owner",
+                "--responsibility",
+                "项目级开发",
+                "--module",
+                ".",
+                "--allow",
+                ".",
+            ).returncode,
+        )
+        self.initialize_git_repository()
+        document_path = (
+            self.project_root
+            / "Plan"
+            / "collaboration"
+            / "active"
+            / "H1-login-api.md"
+        )
+        document_path.write_text("# 登录接口对接\n", encoding="utf-8")
+        self.assertEqual(0, self.run_git("add", "-f", str(document_path)).returncode)
+
+        result = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "project-owner-001",
+        )
+
+        output = result.stdout + result.stderr
+        self.assertEqual(2, result.returncode, output)
+        self.assertIn("Plan/collaboration/active/H1-login-api.md", output)
+        self.assertIn("不得通过一次性授权", output)
+
     def test_backslashes_spaces_and_non_ascii_paths_are_normalized(self) -> None:
         """description: 输入反斜杠、空格和中文路径；输出为规范 Git 相对路径并可匹配目录规则。"""
         module = load_vteam_module()
@@ -542,13 +609,13 @@ class ScopeCheckTests(VTeamTestCase):
         self.assertEqual(before_content, team_path.read_bytes())
         self.assertNotIn("approval", team_path.read_text(encoding="utf-8"))
 
-    def test_git_diff_uses_name_only_head_once(self) -> None:
-        """description: 输入项目路径；输出只调用一次固定参数数组的 Git 差异命令。"""
+    def test_git_diff_uses_cached_name_only_once(self) -> None:
+        """description: 输入项目路径；输出只调用一次固定参数数组的暂存区 Git 差异命令。"""
         module = load_vteam_module()
-        collector = getattr(module, "collect_git_changes", None)
-        self.assertIsNotNone(collector, "缺少 collect_git_changes")
+        collector = getattr(module, "collect_staged_git_changes", None)
+        self.assertIsNotNone(collector, "缺少 collect_staged_git_changes")
         completed = subprocess.CompletedProcess(
-            args=["git", "diff", "--name-only", "HEAD"],
+            args=["git", "diff", "--cached", "--name-only"],
             returncode=0,
             stdout="backend/auth/service.py\n",
             stderr="",
@@ -559,7 +626,7 @@ class ScopeCheckTests(VTeamTestCase):
 
         self.assertEqual(["backend/auth/service.py"], paths)
         runner.assert_called_once_with(
-            ["git", "diff", "--name-only", "HEAD"],
+            ["git", "diff", "--cached", "--name-only"],
             cwd=self.project_root,
             check=False,
             capture_output=True,
@@ -569,7 +636,7 @@ class ScopeCheckTests(VTeamTestCase):
 
 
 class CleanupTests(VTeamTestCase):
-    """description: 验证完成或废弃计划的证据校验、归档、重置和 handoff 清理。"""
+    """description: 验证完成或废弃计划的证据校验、重置和临时 handoff 清理。"""
 
     def setUp(self) -> None:
         """description: 初始化已注册 backend-1 的临时项目；输入为 unittest 生命周期；输出为可写计划。"""
@@ -680,26 +747,26 @@ class CleanupTests(VTeamTestCase):
 
                 self.assertEqual(1, result.returncode, result.stdout + result.stderr)
                 self.assertIn("错误", result.stderr)
-                self.assertFalse(any((self.project_root / "Plan" / "archive").iterdir()))
+                self.assertFalse((self.project_root / "Plan" / "archive").exists())
 
-    def test_abandoned_plan_can_be_archived_with_reason(self) -> None:
-        """description: 输入含放弃原因的 abandoned 计划；输出归档成功；缺少原因时拒绝。"""
+    def test_abandoned_plan_can_be_reset_with_reason(self) -> None:
+        """description: 输入含放弃原因的 abandoned 计划；输出重置成功；缺少原因时拒绝。"""
         self.write_plan("abandoned", [], reason="用户取消该需求。")
 
         accepted_result = self.run_cleanup()
 
         self.assertEqual(0, accepted_result.returncode, accepted_result.stderr)
-        archive_files = list((self.project_root / "Plan" / "archive").glob("*.md"))
-        self.assertEqual(1, len(archive_files))
-        self.assertIn("用户取消该需求", archive_files[0].read_text(encoding="utf-8"))
+        self.assertIn("计划已重置", accepted_result.stdout)
+        self.assertIn("当前无活动任务", self.plan_path.read_text(encoding="utf-8"))
+        self.assertFalse((self.project_root / "Plan" / "archive").exists())
 
         self.write_plan("abandoned", [], reason="无。")
         rejected_result = self.run_cleanup()
         self.assertEqual(1, rejected_result.returncode)
         self.assertIn("放弃原因", rejected_result.stderr)
 
-    def test_completed_plan_is_archived_and_active_plan_is_reset(self) -> None:
-        """description: 输入证据完整的完成计划；输出保留快照并重置为空白草稿。"""
+    def test_completed_plan_is_reset_without_archive(self) -> None:
+        """description: 输入证据完整的完成计划；输出重置为空白草稿且不保留归档。"""
         self.write_plan(
             "completed",
             [("T1", "完成权限功能", "completed", "9 tests OK", self.commit_hash)],
@@ -708,30 +775,32 @@ class CleanupTests(VTeamTestCase):
         result = self.run_cleanup()
 
         self.assertEqual(0, result.returncode, result.stderr)
-        archive_files = list((self.project_root / "Plan" / "archive").glob("*.md"))
-        self.assertEqual(1, len(archive_files))
-        archive_content = archive_files[0].read_text(encoding="utf-8")
-        self.assertIn("完成权限功能", archive_content)
-        self.assertIn("9 tests OK", archive_content)
-        self.assertIn(self.commit_hash, archive_content)
         active_content = self.plan_path.read_text(encoding="utf-8")
         self.assertIn("- Status: `draft`", active_content)
         self.assertIn("当前无活动任务", active_content)
         self.assertNotIn("完成权限功能", active_content)
+        self.assertFalse((self.project_root / "Plan" / "archive").exists())
 
-    def test_closed_handoffs_are_archived_and_removed_from_active_file(self) -> None:
-        """description: 输入已关闭和无关开放 handoff；输出关闭项归档移除且开放项保留。"""
+    def test_closed_handoffs_delete_documents_and_are_removed_from_active_file(self) -> None:
+        """description: 输入已关闭和无关开放 handoff；输出关闭文档删除、关闭项移除且开放项保留。"""
         self.write_plan(
             "completed",
             [("T1", "完成接口", "completed", "API test OK", self.commit_hash)],
         )
+        active_root = self.project_root / "Plan" / "collaboration" / "active"
+        closed_document = active_root / "H1-login-api.md"
+        cancelled_document = active_root / "H2-old-plan.md"
+        open_document = active_root / "H3-report.md"
+        closed_document.write_text("# 登录接口\n", encoding="utf-8")
+        cancelled_document.write_text("# 旧方案\n", encoding="utf-8")
+        open_document.write_text("# 报表\n", encoding="utf-8")
         handoffs = (
             "# 当前跨 Agent 对接\n\n"
-            "| ID | 提出者 | 接收者 | 交付物 | 验收条件 | 状态 |\n"
-            "|---|---|---|---|---|---|\n"
-            "| H1 | backend-1 | frontend-1 | 登录接口 | 联调通过 | completed |\n"
-            "| H2 | backend-1 | tester-1 | 旧方案 | 无 | cancelled |\n"
-            "| H3 | data-1 | report-1 | 报表 | 页面可见 | open |\n"
+            "| ID | 提出者 | 接收者 | 对接文档 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| H1 | backend-1 | frontend-1 | Plan/collaboration/active/H1-login-api.md | 登录接口 | 联调通过 | completed |\n"
+            "| H2 | backend-1 | tester-1 | Plan/collaboration/active/H2-old-plan.md | 旧方案 | 无 | cancelled |\n"
+            "| H3 | data-1 | report-1 | Plan/collaboration/active/H3-report.md | 报表 | 页面可见 | open |\n"
         )
         self.handoffs_path.write_text(handoffs, encoding="utf-8")
 
@@ -742,11 +811,11 @@ class CleanupTests(VTeamTestCase):
         self.assertNotIn("H1", active_handoffs)
         self.assertNotIn("H2", active_handoffs)
         self.assertIn("H3", active_handoffs)
-        archive_content = next(
-            (self.project_root / "Plan" / "archive").glob("*.md")
-        ).read_text(encoding="utf-8")
-        self.assertIn("H1", archive_content)
-        self.assertIn("H2", archive_content)
+        self.assertFalse(closed_document.exists())
+        self.assertFalse(cancelled_document.exists())
+        self.assertTrue(open_document.exists())
+        self.assertIn("H1-login-api.md", result.stdout)
+        self.assertIn("H2-old-plan.md", result.stdout)
 
     def test_open_handoff_involving_agent_blocks_completed_cleanup(self) -> None:
         """description: 输入当前 Agent 参与的开放 handoff；输出拒绝完成计划清理。"""
@@ -789,22 +858,24 @@ class CleanupTests(VTeamTestCase):
         self.assertIn("未知状态", result.stderr)
         self.assertIn("H1", self.handoffs_path.read_text(encoding="utf-8"))
 
-    def test_archive_name_collision_creates_deterministic_suffix(self) -> None:
-        """description: 输入已存在的同日归档；输出新归档使用 -2 且不覆盖旧文件。"""
+    def test_new_handoff_document_must_be_under_active_directory(self) -> None:
+        """description: 输入 Plan 外的新式 handoff 文档路径；输出拒绝清理而不删除文件。"""
         self.write_plan(
             "completed",
             [("T1", "完成权限功能", "completed", "OK", self.commit_hash)],
         )
-        archive_root = self.project_root / "Plan" / "archive"
-        first_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan.md"
-        first_archive.write_text("旧归档\n", encoding="utf-8")
+        handoffs = (
+            "# 当前跨 Agent 对接\n\n"
+            "| ID | 提出者 | 接收者 | 对接文档 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|---|\n"
+            "| H1 | backend-1 | frontend-1 | docs/login-api.md | 登录接口 | 联调通过 | completed |\n"
+        )
+        self.handoffs_path.write_text(handoffs, encoding="utf-8")
 
         result = self.run_cleanup()
 
-        self.assertEqual(0, result.returncode, result.stderr)
-        second_archive = archive_root / f"{date.today().isoformat()}-backend-1-plan-2.md"
-        self.assertTrue(second_archive.is_file())
-        self.assertEqual("旧归档\n", first_archive.read_text(encoding="utf-8"))
+        self.assertEqual(1, result.returncode, result.stdout + result.stderr)
+        self.assertIn("必须位于", result.stderr)
 
     def test_completed_plan_rejects_unknown_commit(self) -> None:
         """description: 输入格式正确但不存在的提交哈希；输出拒绝伪造完成证据。"""
@@ -855,7 +926,9 @@ class SkillContractTests(VTeamTestCase):
         content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
 
         self.assertIn("只在本地提交前统一检查一次", content)
-        self.assertIn("git diff --name-only HEAD", content)
+        self.assertIn("git diff --cached --name-only", content)
+        self.assertIn("`Plan/` 路径不能通过一次性授权绕过", content)
+        self.assertIn("可独立验收的完整功能或可独立验证的明确功能修复", content)
         self.assertNotIn("每次修改文件前", content)
         self.assertNotIn("Git Hook", content)
 
@@ -917,18 +990,18 @@ class SkillContractTests(VTeamTestCase):
         self.assertIn("不创建、切换、命名或管理 Git 分支", content)
         self.assertNotIn("branch naming", content.lower())
 
-    def test_skill_documents_living_collaboration_and_cleanup_rules(self) -> None:
-        """description: 输入技能正文；输出为三份当前态协作文档和安全归档清理规则。"""
+    def test_skill_documents_temporary_collaboration_and_cleanup_rules(self) -> None:
+        """description: 输入技能正文；输出为 Plan 临时对接索引和删除规则。"""
         content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
         required_fragments = [
-            "Plan/collaboration/architecture.md",
-            "Plan/collaboration/api-contracts.md",
             "Plan/collaboration/handoffs.md",
-            "覆盖或修订",
+            "Plan/collaboration/active/<handoff-id>-<topic>.md",
+            "优先索引",
+            "代码、根目录、`doc/` 和 `docs/` 的可靠资料仍可读取",
             "completed",
             "abandoned",
-            "Plan/archive/",
-            "默认忽略归档",
+            "物理删除文档",
+            "不归档临时材料",
         ]
         for fragment in required_fragments:
             self.assertIn(fragment, content)
@@ -948,6 +1021,8 @@ class SkillContractTests(VTeamTestCase):
             "references/review-template.md",
             "references/verification-template.md",
             "references/work-template.md",
+            "references/architecture-template.md",
+            "references/api-contracts-template.md",
         ]
         for relative_path in old_paths:
             self.assertFalse((REPOSITORY_ROOT / relative_path).exists(), relative_path)

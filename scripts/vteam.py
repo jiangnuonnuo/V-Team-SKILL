@@ -8,7 +8,6 @@ import os
 import re
 import subprocess
 import sys
-from datetime import date
 from pathlib import Path
 from typing import Sequence
 
@@ -17,6 +16,10 @@ SKILL_ROOT = Path(__file__).resolve().parents[1]
 REFERENCES_ROOT = SKILL_ROOT / "references"
 VALID_RUNTIMES = {"codex", "claude"}
 TEMPLATE_MARKER_PATTERN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
+PLAN_PATH_PREFIX = "Plan/"
+ACTIVE_HANDOFF_DOCUMENT_PREFIX = "Plan/collaboration/active/"
+LOCAL_EXCLUDE_BEGIN = "# v-team local collaboration artifacts: begin"
+LOCAL_EXCLUDE_END = "# v-team local collaboration artifacts: end"
 
 
 def write_text(path: Path, content: str, overwrite: bool = True) -> None:
@@ -40,6 +43,55 @@ def write_text(path: Path, content: str, overwrite: bool = True) -> None:
     normalized_content = content.rstrip() + "\n"
     with path.open("w", encoding="utf-8", newline="\n") as output_file:
         output_file.write(normalized_content)
+
+
+def ensure_local_plan_excluded(project_root: Path) -> None:
+    """description: 在已有 Git 仓库的本地排除规则中忽略 Plan 临时协作目录。
+
+    Args:
+        project_root: 可能是 Git 仓库的项目根目录。
+
+    Returns:
+        None。非 Git 目录保持无副作用，后续初始化 Git 后可再次运行本工具。
+
+    Raises:
+        OSError: Git 排除文件无法写入时抛出。
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", "info/exclude"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return
+
+    raw_exclude_path = result.stdout.strip()
+    if not raw_exclude_path:
+        return
+    exclude_path = Path(raw_exclude_path)
+    if not exclude_path.is_absolute():
+        exclude_path = project_root / exclude_path
+
+    current_content = (
+        exclude_path.read_text(encoding="utf-8")
+        if exclude_path.exists()
+        else ""
+    )
+    managed_block = f"{LOCAL_EXCLUDE_BEGIN}\n/Plan/\n{LOCAL_EXCLUDE_END}"
+    pattern = re.compile(
+        rf"^{re.escape(LOCAL_EXCLUDE_BEGIN)}\n.*?^{re.escape(LOCAL_EXCLUDE_END)}$",
+        re.MULTILINE | re.DOTALL,
+    )
+    if pattern.search(current_content):
+        updated_content = pattern.sub(managed_block, current_content)
+    else:
+        separator = "" if not current_content or current_content.endswith("\n") else "\n"
+        updated_content = f"{current_content}{separator}{managed_block}\n"
+
+    write_text(exclude_path, updated_content)
 
 
 def render_template(template_name: str, values: dict[str, str]) -> str:
@@ -156,7 +208,7 @@ def decode_git_path(raw_path: str) -> str:
     """description: 解码 Git 默认输出中的 C 风格引号与八进制 UTF-8 字节。
 
     Args:
-        raw_path: `git diff --name-only HEAD` 输出的一行路径。
+        raw_path: Git 路径列表输出的一行路径。
 
     Returns:
         可直接规范化和匹配的 Unicode 路径。
@@ -299,14 +351,14 @@ def path_is_allowed(
     return False
 
 
-def collect_git_changes(project_root: Path) -> list[str]:
-    """description: 统一读取当前本地提交相对 HEAD 涉及的全部路径。
+def collect_staged_git_changes(project_root: Path) -> list[str]:
+    """description: 统一读取当前暂存区中准备进入本地提交的全部路径。
 
     Args:
         project_root: 已初始化 Git 仓库的项目根目录。
 
     Returns:
-        已解码、规范化并去除空行的变更路径列表。
+        已解码、规范化并去除空行的暂存路径列表。
 
     Raises:
         RuntimeError: Git 命令失败。
@@ -314,7 +366,7 @@ def collect_git_changes(project_root: Path) -> list[str]:
         OSError: Git 无法启动。
     """
     result = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "diff", "--cached", "--name-only"],
         cwd=project_root,
         check=False,
         capture_output=True,
@@ -322,7 +374,7 @@ def collect_git_changes(project_root: Path) -> list[str]:
         encoding="utf-8",
     )
     if result.returncode != 0:
-        error_message = result.stderr.strip() or "git diff 执行失败"
+        error_message = result.stderr.strip() or "git diff --cached 执行失败"
         raise RuntimeError(error_message)
 
     changed_paths: list[str] = []
@@ -335,14 +387,14 @@ def collect_git_changes(project_root: Path) -> list[str]:
 
 
 def check_scope(project_root: Path, agent_id: str) -> list[str]:
-    """description: 检查一次当前 Git 变更是否全部属于指定 Agent 白名单。
+    """description: 检查一次暂存内容是否可进入指定 Agent 的本地提交。
 
     Args:
         project_root: 包含 Git 仓库和 Plan/team.json 的项目根目录。
         agent_id: 需要执行本地提交的 Agent ID。
 
     Returns:
-        不在永久白名单内的全部变更路径。
+        `Plan/` 路径和不在永久白名单内的全部暂存路径。
 
     Raises:
         ValueError: Agent ID 不存在或配置、路径无效。
@@ -360,12 +412,13 @@ def check_scope(project_root: Path, agent_id: str) -> list[str]:
     if matching_agent is None:
         raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
 
-    changed_paths = collect_git_changes(project_root)
+    ensure_local_plan_excluded(project_root)
+    changed_paths = collect_staged_git_changes(project_root)
     whitelist = matching_agent["write_whitelist"]
     return [
         path
         for path in changed_paths
-        if not path_is_allowed(path, whitelist)
+        if path.startswith(PLAN_PATH_PREFIX) or not path_is_allowed(path, whitelist)
     ]
 
 
@@ -524,27 +577,50 @@ def parse_handoff_rows(handoffs_text: str) -> list[dict[str, str]]:
         handoffs_text: `Plan/collaboration/handoffs.md` 完整文本。
 
     Returns:
-        包含 ID、参与者、交付物、验收条件、状态和原行的字典列表。
+        包含 ID、参与者、临时文档、交付物、验收条件、状态和原行的字典列表。
 
     Raises:
-        ValueError: handoff 表格行列数不符合固定格式。
+        ValueError: handoff 表格行列数或临时文档路径不符合格式。
     """
     rows: list[dict[str, str]] = []
     for line_number, line in enumerate(handoffs_text.splitlines(), start=1):
-        try:
-            cells = parse_markdown_row(line, 6)
-        except ValueError as error:
-            raise ValueError(f"handoffs.md 第 {line_number} 行错误: {error}") from error
-        if cells is None:
+        stripped_line = line.strip()
+        if not stripped_line.startswith("|") or not stripped_line.endswith("|"):
             continue
+        cells = [cell.strip() for cell in stripped_line[1:-1].split("|")]
+        if all(not cell or set(cell) <= {"-", ":"} for cell in cells):
+            continue
+        if cells and cells[0] in {"ID", "Id", "id"}:
+            continue
+        if len(cells) not in {6, 7}:
+            raise ValueError(
+                f"handoffs.md 第 {line_number} 行错误: 预期 6 或 7 列，实际 {len(cells)} 列: {line}"
+            )
+
+        # 六列表格来自旧版本，没有可删除的临时文档；新表格必须登记 Plan/ 下的路径。
+        document_path = "-" if len(cells) == 6 else cells[3]
+        if document_path not in {"", "-", "无", "无。"}:
+            normalized_path = normalize_relative_path(document_path)
+            if not normalized_path.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX):
+                raise ValueError(
+                    f"handoffs.md 第 {line_number} 行的对接文档必须位于 "
+                    f"{ACTIVE_HANDOFF_DOCUMENT_PREFIX}: {document_path}"
+                )
+            document_path = normalized_path
+
+        if len(cells) == 6:
+            deliverable, acceptance, status = cells[3], cells[4], cells[5]
+        else:
+            deliverable, acceptance, status = cells[4], cells[5], cells[6]
         rows.append(
             {
                 "id": cells[0],
                 "proposer": cells[1],
                 "receiver": cells[2],
-                "deliverable": cells[3],
-                "acceptance": cells[4],
-                "status": cells[5],
+                "document_path": document_path,
+                "deliverable": deliverable,
+                "acceptance": acceptance,
+                "status": status,
                 "raw_line": line.strip(),
             }
         )
@@ -680,69 +756,79 @@ def check_plan(project_root: Path, agent_id: str) -> None:
     validate_review_state(plan_state)
 
 
-def next_archive_path(archive_root: Path, agent_id: str, date_text: str) -> Path:
-    """description: 生成不会覆盖已有完成证据的确定性归档路径。
-
-    Args:
-        archive_root: 项目 `Plan/archive` 目录。
-        agent_id: 被归档计划的 Agent ID。
-        date_text: ISO 日期文本。
-
-    Returns:
-        首个不存在的 `<date>-<agent-id>-plan[-N].md` 路径。
-
-    Raises:
-        ValueError: Agent ID 不安全。
-    """
-    normalized_agent_id = validate_agent_id(agent_id)
-    first_candidate = archive_root / f"{date_text}-{normalized_agent_id}-plan.md"
-    if not first_candidate.exists():
-        return first_candidate
-
-    suffix = 2
-    while True:
-        candidate = archive_root / f"{date_text}-{normalized_agent_id}-plan-{suffix}.md"
-        if not candidate.exists():
-            return candidate
-        suffix += 1
-
-
-def remove_closed_handoffs(handoffs_text: str) -> tuple[str, list[str]]:
+def remove_closed_handoffs(handoffs_text: str) -> tuple[str, list[dict[str, str]]]:
     """description: 从活动 handoff 表移除已完成或已取消事项。
 
     Args:
         handoffs_text: 当前 handoffs.md 完整文本。
 
     Returns:
-        精简后的活动文本，以及移除行的原始摘要列表。
+        精简后的活动文本，以及移除的 handoff 记录。
 
     Raises:
         ValueError: 表格格式错误。
     """
     closed_statuses = {"completed", "cancelled"}
-    closed_rows = {
-        handoff["raw_line"]
+    closed_handoffs = [
+        handoff
         for handoff in parse_handoff_rows(handoffs_text)
         if handoff["status"] in closed_statuses
-    }
+    ]
+    closed_rows = {handoff["raw_line"] for handoff in closed_handoffs}
     active_lines = [
         line
         for line in handoffs_text.splitlines()
         if line.strip() not in closed_rows
     ]
     active_text = "\n".join(active_lines).rstrip() + "\n"
-    return active_text, sorted(closed_rows)
+    return active_text, closed_handoffs
 
 
-def cleanup_agent_plan(project_root: Path, agent_id: str) -> Path:
-    """description: 归档完成或废弃计划，重置活动计划并清理关闭的 handoff。
+def remove_closed_handoff_documents(
+    project_root: Path,
+    closed_handoffs: Sequence[dict[str, str]],
+) -> list[Path]:
+    """description: 删除已关闭 handoff 登记的临时对接文档。
+
+    Args:
+        project_root: V-Team 项目根目录。
+        closed_handoffs: 已关闭 handoff 的解析记录。
+
+    Returns:
+        实际删除的项目相对文档路径。
+
+    Raises:
+        ValueError: 登记路径不属于 Plan 临时协作目录。
+        OSError: 文件删除失败。
+    """
+    deleted_paths: list[Path] = []
+    seen_paths: set[str] = set()
+    for handoff in closed_handoffs:
+        document_path = handoff["document_path"]
+        if document_path in {"", "-", "无", "无。"} or document_path in seen_paths:
+            continue
+        seen_paths.add(document_path)
+        normalized_path = normalize_relative_path(document_path)
+        if not normalized_path.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX):
+            raise ValueError(
+                f"已关闭对接 {handoff['id']} 的文档不在临时协作目录: {document_path}"
+            )
+        absolute_path = project_root / normalized_path
+        if absolute_path.exists():
+            absolute_path.unlink()
+            deleted_paths.append(Path(normalized_path))
+    return deleted_paths
+
+
+def cleanup_agent_plan(project_root: Path, agent_id: str) -> list[Path]:
+    """description: 重置完成或废弃计划，并删除已关闭 handoff 的临时文档。
 
     Args:
         project_root: 已初始化的 V-Team 项目根目录。
         agent_id: 需要清理活动计划的 Agent ID。
 
     Returns:
-        新生成的归档文件路径。
+        已删除的临时对接文档路径。
 
     Raises:
         FileNotFoundError: 个人计划或 handoff 文档不存在。
@@ -776,34 +862,13 @@ def cleanup_agent_plan(project_root: Path, agent_id: str) -> Path:
     )
     active_handoffs, closed_handoffs = remove_closed_handoffs(handoffs_text)
 
-    # 先写入新归档，任何后续失败都不会丢失原计划证据。
-    archive_root = project_root / "Plan" / "archive"
-    archive_root.mkdir(parents=True, exist_ok=True)
-    archived_on = date.today().isoformat()
-    archive_path = next_archive_path(
-        archive_root,
-        normalized_agent_id,
-        archived_on,
-    )
-    closed_summary = "\n".join(closed_handoffs) if closed_handoffs else "- 无。"
-    archive_content = (
-        f"# {normalized_agent_id} 计划归档\n\n"
-        f"- Archived on: `{archived_on}`\n"
-        f"- Final status: `{plan_state['status']}`\n\n"
-        "## 活动计划快照\n\n"
-        f"{plan_state['content'].rstrip()}\n\n"
-        "## 本次移除的已关闭对接\n\n"
-        f"{closed_summary}\n"
-    )
-    write_text(archive_path, archive_content, overwrite=False)
-
     reset_plan = render_template(
         "plan-template.md",
         {"AGENT_ID": normalized_agent_id},
     )
     write_text(plan_path, reset_plan)
     write_text(handoffs_path, active_handoffs)
-    return archive_path
+    return remove_closed_handoff_documents(project_root, closed_handoffs)
 
 
 def validate_agent_id(agent_id: str) -> str:
@@ -1015,11 +1080,10 @@ def initialize_project(project_root: Path, runtimes: Sequence[str]) -> None:
     normalized_runtimes = normalize_runtime_values(runtimes)
     project_root.mkdir(parents=True, exist_ok=True)
 
-    # 先创建固定目录，确保任何 Agent 都使用相同的无版本结构。
+    # 先创建固定目录，确保临时协作材料只在 Plan 内流转。
     plan_root = project_root / "Plan"
     (plan_root / "agents").mkdir(parents=True, exist_ok=True)
-    (plan_root / "collaboration").mkdir(parents=True, exist_ok=True)
-    (plan_root / "archive").mkdir(parents=True, exist_ok=True)
+    (plan_root / "collaboration" / "active").mkdir(parents=True, exist_ok=True)
 
     team_path = plan_root / "team.json"
     if team_path.exists():
@@ -1050,13 +1114,12 @@ def initialize_project(project_root: Path, runtimes: Sequence[str]) -> None:
     initial_files = {
         plan_root / "project.md": "project-template.md",
         plan_root / "onboarding.md": "quick-onboarding-template.md",
-        plan_root / "collaboration" / "architecture.md": "architecture-template.md",
-        plan_root / "collaboration" / "api-contracts.md": "api-contracts-template.md",
         plan_root / "collaboration" / "handoffs.md": "handoffs-template.md",
     }
     for output_path, template_name in initial_files.items():
         write_text(output_path, render_template(template_name, {}), overwrite=False)
 
+    ensure_local_plan_excluded(project_root)
     refresh_root_rules(project_root, team["runtimes"])
 
 
@@ -1166,6 +1229,7 @@ def upsert_agent(
         {"AGENT_ID": normalized_agent_id},
     )
     write_text(agent_root / "PLAN.md", plan_content, overwrite=False)
+    ensure_local_plan_excluded(project_root)
     refresh_root_rules(project_root, team["runtimes"])
 
 
@@ -1229,7 +1293,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     cleanup_parser = subparsers.add_parser(
         "cleanup",
-        help="归档完成或废弃计划并重置活动上下文",
+        help="清理关闭对接文档并重置完成或废弃计划",
     )
     cleanup_parser.add_argument("--project-root", required=True, type=Path)
     cleanup_parser.add_argument("--agent-id", required=True)
@@ -1290,24 +1354,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
 
             print(f"发现白名单外路径，Agent: {arguments.agent_id}", file=sys.stderr)
+            plan_violations = [
+                path for path in violations if path.startswith(PLAN_PATH_PREFIX)
+            ]
+            ordinary_violations = [
+                path for path in violations if path not in plan_violations
+            ]
             for violation in violations:
                 print(f"- {violation}", file=sys.stderr)
-            print(
-                "暂停当前本地提交；请向用户说明修改原因和影响，并询问是否允许本次提交。",
-                file=sys.stderr,
-            )
-            print(
-                "用户同意后只在当前 PLAN.md 记录一次性授权；该授权不会扩大永久白名单。",
-                file=sys.stderr,
-            )
+            if plan_violations:
+                print(
+                    "Plan/ 是本地临时协作区，必须从暂存区移除；不得通过一次性授权提交。",
+                    file=sys.stderr,
+                )
+            if ordinary_violations:
+                print(
+                    "暂停当前本地提交；请向用户说明修改原因和影响，并询问是否允许本次提交。",
+                    file=sys.stderr,
+                )
+                print(
+                    "用户同意后只在当前 PLAN.md 记录一次性授权；该授权不会扩大永久白名单。",
+                    file=sys.stderr,
+                )
             return 2
 
         if arguments.command == "cleanup":
-            archive_path = cleanup_agent_plan(
+            deleted_paths = cleanup_agent_plan(
                 project_root=arguments.project_root,
                 agent_id=arguments.agent_id,
             )
-            print(f"计划已归档并重置: {archive_path}")
+            if deleted_paths:
+                paths_text = ", ".join(path.as_posix() for path in deleted_paths)
+                print(f"计划已重置，已清理对接文档: {paths_text}")
+            else:
+                print("计划已重置，没有需要清理的对接文档")
             return 0
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
