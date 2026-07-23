@@ -1,4 +1,4 @@
 interface:
   display_name: "V-Team"
-  short_description: "Codex/Claude 多 Agent 项目协作、计划与模块边界约束"
-  default_prompt: "Use $v-team to onboard project-local agents from a user-provided identity and business scope, then set collaboration boundaries and an approval-gated development plan."
+  short_description: "Multi-agent project skill: identity, whitelist, plan approval, risk tests, check-scope"
+  default_prompt: "Use $v-team to set up project-local multi-agent collaboration: confirm agent identity and business scope, write one approval-gated PLAN.md, enforce module boundaries with check-plan/check-scope, and keep Plan/ handoffs local (never commit them)."

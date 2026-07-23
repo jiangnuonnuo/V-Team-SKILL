@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "diagram_type": "workflow",
+  "meta": {
+    "title": "V-Team Forced Delivery Loop",
+    "subtitle": "Identity → plan review → human approval → risk-based test → scoped local commit",
+    "output": "v-team-workflow.html",
+    "animation": "trace",
+    "quality_profile": "showcase",
+    "visual_preset": "signal-flow",
+    "views": [
+      {
+        "id": "onboard",
+        "label": "Onboard & plan",
+        "focus": ["confirm_id", "read_rules", "write_plan", "review_plan", "check_plan", "wait_approve"],
+        "note": "Nothing is implemented until review is green and a human signs off."
+      },
+      {
+        "id": "build",
+        "label": "Build under gates",
+        "focus": ["wait_approve", "implement", "risk_test", "check_scope", "local_commit"],
+        "note": "One complete feature or fix per commit — never a file-shard PR mindset."
+      },
+      {
+        "id": "stop-path",
+        "label": "Stop conditions",
+        "focus": ["risk_test", "test_fail", "check_scope", "scope_block"],
+        "note": "Red tests and out-of-scope paths stay explicit; one-shot auth never expands the permanent whitelist."
+      }
+    ]
+  },
+  "lanes": [
+    { "id": "human", "label": "Human Owner" },
+    { "id": "agent", "label": "Bound Agent Session" },
+    { "id": "reviewer", "label": "Independent Reviewer" },
+    { "id": "cli", "label": "vteam.py Gates" },
+    { "id": "git", "label": "Local Git" },
+    { "id": "exceptions", "label": "Stop · Authorize", "variant": "exception" }
+  ],
+  "phases": [
+    { "id": "identity", "label": "Identity", "fromCol": 0, "toCol": 1 },
+    { "id": "govern", "label": "Plan governance", "fromCol": 2, "toCol": 3, "variant": "emphasis" },
+    { "id": "deliver", "label": "Deliver locally", "fromCol": 4, "toCol": 5, "variant": "dashed" }
+  ],
+  "groups": [
+    {
+      "id": "approval_box",
+      "label": "Human approval gate",
+      "lane": "human",
+      "fromCol": 3,
+      "toCol": 3,
+      "variant": "security"
+    },
+    {
+      "id": "exception_path",
+      "label": "If delivery is blocked",
+      "lane": "exceptions",
+      "fromCol": 4,
+      "toCol": 5,
+      "variant": "security"
+    }
+  ],
+  "mainPath": [
+    "confirm_id",
+    "read_rules",
+    "write_plan",
+    "review_plan",
+    "check_plan",
+    "wait_approve",
+    "implement",
+    "risk_test",
+    "check_scope",
+    "local_commit"
+  ],
+  "nodes": [
+    {
+      "id": "confirm_id",
+      "lane": "agent",
+      "col": 0,
+      "type": "frontend",
+      "label": "Confirm ID",
+      "sublabel": "or onboarding",
+      "tag": "hard stop"
+    },
+    {
+      "id": "read_rules",
+      "lane": "agent",
+      "col": 1,
+      "width": 76,
+      "type": "security",
+      "label": "Read rules",
+      "sublabel": "root + AGENT"
+    },
+    {
+      "id": "write_plan",
+      "lane": "agent",
+      "col": 2,
+      "width": 64,
+      "type": "backend",
+      "label": "Write plan",
+      "sublabel": "one PLAN.md",
+      "tag": "feat-sized"
+    },
+    {
+      "id": "review_plan",
+      "lane": "reviewer",
+      "col": 2,
+      "width": 64,
+      "type": "security",
+      "label": "Review",
+      "sublabel": "scope · risk",
+      "tag": "independent"
+    },
+    {
+      "id": "check_plan",
+      "lane": "cli",
+      "col": 3,
+      "type": "backend",
+      "label": "check-plan",
+      "sublabel": "record OK?",
+      "tag": "exit 0/2"
+    },
+    {
+      "id": "wait_approve",
+      "lane": "human",
+      "col": 3,
+      "type": "security",
+      "label": "Approve",
+      "sublabel": "user sign-off",
+      "tag": "required"
+    },
+    {
+      "id": "implement",
+      "lane": "agent",
+      "col": 4,
+      "width": 64,
+      "type": "backend",
+      "label": "Implement",
+      "sublabel": "feature / fix"
+    },
+    {
+      "id": "risk_test",
+      "lane": "agent",
+      "col": 5,
+      "type": "frontend",
+      "label": "Risk tests",
+      "sublabel": "targeted→full",
+      "tag": "evidence"
+    },
+    {
+      "id": "check_scope",
+      "lane": "cli",
+      "col": 5,
+      "type": "security",
+      "label": "check-scope",
+      "sublabel": "one cached diff",
+      "tag": "blocking"
+    },
+    {
+      "id": "local_commit",
+      "lane": "git",
+      "col": 5,
+      "type": "database",
+      "label": "Local commit",
+      "sublabel": "中文 feat/fix",
+      "tag": "no push"
+    },
+    {
+      "id": "test_fail",
+      "lane": "exceptions",
+      "col": 5,
+      "width": 72,
+      "type": "security",
+      "label": "Test red",
+      "sublabel": "no commit"
+    },
+    {
+      "id": "scope_block",
+      "lane": "exceptions",
+      "col": 4,
+      "width": 90,
+      "type": "security",
+      "label": "Out of bound",
+      "sublabel": "one-shot auth",
+      "tag": "user decides"
+    }
+  ],
+  "edges": [
+    { "id": "e1", "from": "confirm_id", "to": "read_rules", "variant": "emphasis" },
+    {
+      "id": "e2",
+      "from": "read_rules",
+      "to": "write_plan",
+      "variant": "emphasis",
+      "route": "bottom-channel",
+      "fromSide": "bottom",
+      "toSide": "bottom"
+    },
+    {
+      "id": "e3",
+      "from": "write_plan",
+      "to": "review_plan",
+      "label": "request",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 18
+    },
+    {
+      "id": "e4",
+      "from": "review_plan",
+      "to": "check_plan",
+      "route": "drop",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "e5",
+      "from": "check_plan",
+      "to": "wait_approve",
+      "label": "pass",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": -18
+    },
+    {
+      "id": "e6",
+      "from": "wait_approve",
+      "to": "implement",
+      "label": "approved",
+      "variant": "security",
+      "route": "drop",
+      "fromSide": "right",
+      "toSide": "top",
+      "labelAt": [520, 50]
+    },
+    {
+      "id": "e7",
+      "from": "implement",
+      "to": "risk_test",
+      "variant": "emphasis",
+      "route": "bottom-channel",
+      "fromSide": "bottom",
+      "toSide": "bottom"
+    },
+    {
+      "id": "e8",
+      "from": "risk_test",
+      "to": "check_scope",
+      "label": "green",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 18
+    },
+    {
+      "id": "e10",
+      "from": "check_scope",
+      "to": "local_commit",
+      "label": "in bound",
+      "variant": "emphasis",
+      "route": "drop",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 18
+    },
+    {
+      "id": "e-red",
+      "from": "risk_test",
+      "to": "test_fail",
+      "label": "fail",
+      "variant": "security",
+      "role": "error",
+      "route": "outside-right",
+      "fromSide": "right",
+      "toSide": "right",
+      "labelDy": 12
+    },
+    {
+      "id": "e-scope",
+      "from": "check_scope",
+      "to": "scope_block",
+      "label": "OOB",
+      "variant": "security",
+      "role": "error",
+      "route": "drop",
+      "fromSide": "left",
+      "toSide": "top",
+      "via": [[500, 491], [500, 640]],
+      "labelAt": [500, 560]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "Outcome-first tasks",
+      "items": [
+        "Each task is a shippable feature or a verifiable fix",
+        "Risk chooses test depth: targeted · related · full-repo",
+        "Evidence can be reused until code or config actually changes"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "What V-Team refuses to do",
+      "items": [
+        "No remote push, no merge, no branch babysitting",
+        "No Plan/ files in product commits — ever",
+        "No permanent whitelist expansion via a single exception"
+      ]
+    },
+    {
+      "dot": "cyan",
+      "title": "Why this scales a squad of AIs",
+      "items": [
+        "Independent sessions share structure, not chat logs",
+        "Handoffs are indexed contracts, then deleted when done",
+        "Recoverable PLAN.md survives context loss"
+      ]
+    }
+  ]
+}

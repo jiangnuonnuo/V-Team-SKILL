@@ -1,0 +1,315 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "V-Team · Multi-Agent Collaboration OS",
+    "subtitle": "Codex + Claude project-local team · identity · plan · scope · handoff",
+    "output": "v-team-system.html",
+    "quality_profile": "showcase",
+    "visual_preset": "signal-flow",
+    "views": [
+      {
+        "id": "happy-path",
+        "label": "From prompt to local commit",
+        "focus": ["user", "runtime", "root-rules", "agent-md", "plan-md", "gates", "git"],
+        "note": "Follow how a human intent becomes a reviewed, scoped, locally committed feature."
+      },
+      {
+        "id": "control-plane",
+        "label": "Control plane facts",
+        "focus": ["cli", "templates", "team-json", "agent-md", "plan-md"],
+        "note": "team.json is the identity fact source; templates stamp enforceable behavior files."
+      },
+      {
+        "id": "collab-zone",
+        "label": "Ephemeral collaboration",
+        "focus": ["handoffs", "active-docs", "plan-md", "gates"],
+        "note": "Cross-agent contracts live only in Plan/, never pollute the product Git history."
+      },
+      {
+        "id": "dual-runtime",
+        "label": "Dual runtime surface",
+        "focus": ["user", "runtime", "root-rules", "cli"],
+        "note": "Same discipline on Codex (AGENTS.md) and Claude (CLAUDE.md), mixed teams welcome."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "user",
+      "type": "external",
+      "label": "You / Team Lead",
+      "sublabel": "identity · scope · approve",
+      "pos": [40, 280],
+      "size": [128, 64],
+      "tag": "human gate"
+    },
+    {
+      "id": "runtime",
+      "type": "frontend",
+      "label": "Agent Hosts",
+      "sublabel": "Codex · Claude · mixed",
+      "pos": [220, 280],
+      "size": [140, 64],
+      "tag": "sessions"
+    },
+    {
+      "id": "root-rules",
+      "type": "security",
+      "label": "Root Constraints",
+      "sublabel": "AGENTS.md / CLAUDE.md",
+      "pos": [420, 280],
+      "size": [150, 64],
+      "tag": "entry"
+    },
+    {
+      "id": "agent-md",
+      "type": "backend",
+      "label": "AGENT.md",
+      "sublabel": "personal identity",
+      "pos": [640, 200],
+      "size": [132, 56]
+    },
+    {
+      "id": "plan-md",
+      "type": "backend",
+      "label": "PLAN.md",
+      "sublabel": "single active plan",
+      "pos": [640, 300],
+      "size": [132, 56],
+      "tag": "approval"
+    },
+    {
+      "id": "gates",
+      "type": "security",
+      "label": "Quality Gates",
+      "sublabel": "plan · scope · cleanup",
+      "pos": [840, 280],
+      "size": [140, 64],
+      "tag": "blocking"
+    },
+    {
+      "id": "git",
+      "type": "database",
+      "label": "Local Git",
+      "sublabel": "feat / fix only",
+      "pos": [1040, 280],
+      "size": [128, 64],
+      "tag": "no push"
+    },
+    {
+      "id": "cli",
+      "type": "backend",
+      "label": "vteam.py CLI",
+      "sublabel": "init · agent · gates",
+      "pos": [220, 80],
+      "size": [140, 56],
+      "tag": "stdlib only"
+    },
+    {
+      "id": "templates",
+      "type": "cloud",
+      "label": "Skill Templates",
+      "sublabel": "references/*",
+      "pos": [40, 80],
+      "size": [140, 56]
+    },
+    {
+      "id": "team-json",
+      "type": "database",
+      "label": "team.json",
+      "sublabel": "roles · whitelist",
+      "pos": [420, 80],
+      "size": [140, 56],
+      "tag": "fact source"
+    },
+    {
+      "id": "handoffs",
+      "type": "messagebus",
+      "label": "handoffs.md",
+      "sublabel": "open deliveries",
+      "pos": [640, 440],
+      "size": [132, 52]
+    },
+    {
+      "id": "active-docs",
+      "type": "messagebus",
+      "label": "active/*.md",
+      "sublabel": "temp contracts",
+      "pos": [840, 440],
+      "size": [132, 52],
+      "tag": "ephemeral"
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "V-Team Skill Runtime",
+      "wraps": ["cli", "templates"]
+    },
+    {
+      "kind": "security-group",
+      "label": "Plan/ · local-only collaboration (never committed)",
+      "wraps": ["team-json", "agent-md", "plan-md", "handoffs", "active-docs"]
+    },
+    {
+      "kind": "region",
+      "label": "Project Workspace",
+      "wraps": ["root-rules", "gates", "git"]
+    }
+  ],
+  "connections": [
+    {
+      "id": "intent-in",
+      "from": "user",
+      "to": "runtime",
+      "label": "task + agent-id",
+      "variant": "emphasis",
+      "labelDy": -30
+    },
+    {
+      "id": "read-entry",
+      "from": "runtime",
+      "to": "root-rules",
+      "label": "must read",
+      "variant": "emphasis",
+      "labelDy": -30
+    },
+    {
+      "id": "load-identity",
+      "from": "root-rules",
+      "to": "agent-md",
+      "label": "bind id",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": -24
+    },
+    {
+      "id": "load-plan",
+      "from": "agent-md",
+      "to": "plan-md",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "enter-gates",
+      "from": "plan-md",
+      "to": "gates",
+      "label": "review + scope",
+      "variant": "emphasis",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelAt": [806, 370]
+    },
+    {
+      "id": "commit-local",
+      "from": "gates",
+      "to": "git",
+      "label": "pass → commit",
+      "variant": "emphasis",
+      "labelDy": -30
+    },
+    {
+      "id": "bootstrap",
+      "from": "user",
+      "to": "cli",
+      "label": "init",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom",
+      "labelDy": -36
+    },
+    {
+      "id": "stamp-templates",
+      "from": "templates",
+      "to": "cli",
+      "route": "straight"
+    },
+    {
+      "id": "cli-writes-facts",
+      "from": "cli",
+      "to": "team-json",
+      "label": "facts",
+      "labelDy": -22
+    },
+    {
+      "id": "facts-to-identity",
+      "from": "team-json",
+      "to": "agent-md",
+      "label": "regenerate",
+      "variant": "dashed",
+      "fromSide": "right",
+      "toSide": "top",
+      "via": [[600, 108], [706, 108], [706, 180]],
+      "labelDy": -16
+    },
+    {
+      "id": "cli-stamps-root",
+      "from": "cli",
+      "to": "root-rules",
+      "label": "render",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "via": [[290, 170], [495, 170], [495, 260]],
+      "labelAt": [390, 158]
+    },
+    {
+      "id": "collab-index",
+      "from": "plan-md",
+      "to": "handoffs",
+      "label": "if needed",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 30
+    },
+    {
+      "id": "open-contracts",
+      "from": "handoffs",
+      "to": "active-docs",
+      "label": "index",
+      "labelDy": -22
+    },
+    {
+      "id": "approve-loop",
+      "from": "user",
+      "to": "plan-md",
+      "label": "approve plan",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "left",
+      "via": [[104, 540], [610, 540], [610, 328]],
+      "labelDy": 16
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Why teams adopt it",
+      "items": [
+        "Turns free-form AI coding into a disciplined multi-agent squad",
+        "Same playbook for Codex, Claude, or mixed fleets",
+        "Zero third-party deps — Python stdlib + Git only"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "What stays out of Git",
+      "items": [
+        "Plan/ is local collaboration memory, auto-excluded",
+        "Temp handoff docs delete on cleanup — no archive clutter",
+        "Product history stays clean feat/fix commits"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Hard stops that save repos",
+      "items": [
+        "No agent-id → no code",
+        "No plan approval → no implementation",
+        "No scope pass → no local commit; never push/merge"
+      ]
+    }
+  ]
+}
