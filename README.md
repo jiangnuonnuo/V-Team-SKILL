@@ -110,6 +110,7 @@ python scripts/vteam.py handoff doctor --project-root /path/to/project
 python "F:\path\to\V-Team-SKILL\scripts\vteam.py" init --project-root "F:\path\to\project" --runtime codex
 python "F:\path\to\V-Team-SKILL\scripts\vteam.py" agent --project-root "F:\path\to\project" --agent-id backend-1 --runtime codex --role backend --responsibility "用户与权限后端" --scope "用户与权限后端全部代码" --module backend/auth --allow backend/auth/ --allow tests/auth/ --read-doc Plan/collaboration/handoffs.md
 python "F:\path\to\V-Team-SKILL\scripts\vteam.py" check-plan  --project-root "F:\path\to\project" --agent-id backend-1
+python "F:\path\to\V-Team-SKILL\scripts\vteam.py" handoff list --project-root "F:\path\to\project" --agent-id backend-1
 python "F:\path\to\V-Team-SKILL\scripts\vteam.py" check-scope --project-root "F:\path\to\project" --agent-id backend-1
 python "F:\path\to\V-Team-SKILL\scripts\vteam.py" cleanup     --project-root "F:\path\to\project" --agent-id backend-1
 ```
@@ -120,6 +121,7 @@ python "F:\path\to\V-Team-SKILL\scripts\vteam.py" cleanup     --project-root "F:
 python "/path/to/V-Team-SKILL/scripts/vteam.py" init --project-root "/path/to/project" --runtime codex --runtime claude
 python "/path/to/V-Team-SKILL/scripts/vteam.py" agent --project-root "/path/to/project" --agent-id frontend-1 --runtime claude --role frontend --responsibility "登录页面与接口集成" --scope "用户端前端全部代码" --module frontend/auth --allow frontend/auth/ --read-doc Plan/collaboration/handoffs.md
 python "/path/to/V-Team-SKILL/scripts/vteam.py" check-plan  --project-root "/path/to/project" --agent-id frontend-1
+python "/path/to/V-Team-SKILL/scripts/vteam.py" handoff list --project-root "/path/to/project" --agent-id frontend-1
 python "/path/to/V-Team-SKILL/scripts/vteam.py" check-scope --project-root "/path/to/project" --agent-id frontend-1
 python "/path/to/V-Team-SKILL/scripts/vteam.py" cleanup     --project-root "/path/to/project" --agent-id frontend-1
 ```

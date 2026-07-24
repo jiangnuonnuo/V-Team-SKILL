@@ -26,7 +26,7 @@
 2. 本文件 `Plan/agents/{{AGENT_ID}}/AGENT.md`。
 3. 唯一活动计划 `Plan/agents/{{AGENT_ID}}/PLAN.md`。
 4. `Plan/project.md`。
-5. 运行 `handoff list --agent-id {{AGENT_ID}}`，仅 Read 返回且存在的 `doc` 路径；把结果写入本 PLAN「协作依赖」表。禁止 ls/glob 批量扫描 `Plan/collaboration/active/`。
+5. 运行 `handoff list --project-root <project-root> --agent-id {{AGENT_ID}}`，仅 Read 返回且存在的 `doc` 路径；把结果写入本 PLAN「协作依赖」表。禁止 ls/glob 批量扫描 `Plan/collaboration/active/`。
 6. 下列与当前任务直接相关的当前态协作文档（补充，不是替代 list）：
 
 {{COLLABORATION_DOCS}}

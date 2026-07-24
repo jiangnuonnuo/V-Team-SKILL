@@ -13,7 +13,7 @@ V-Team 是 Codex / Claude 的多 Agent **项目协作技能**，不是 CI 平台
 - 个人身份（`Plan/agents/<id>/AGENT.md`）
 - 唯一活动计划（`PLAN.md`）
 - 本地协作区（`Plan/`，默认不进 Git）
-- 可执行门禁（`check-plan` / `check-scope` / `cleanup`）
+- 可执行门禁（`check-plan` / `check-scope` / `cleanup` / `handoff`）
 
 目标很具体：**让多个 Agent 在同一仓库里并行，但有身份、有边界、有审批、有证据、有清理。**
 
@@ -42,7 +42,7 @@ You / Team Lead
   → Root Constraints (AGENTS.md / CLAUDE.md)
   → AGENT.md
   → PLAN.md
-  → Quality Gates (check-plan · check-scope · cleanup)
+  → Quality Gates (check-plan · check-scope · handoff · cleanup)
   → Local Git (feat / fix · no push)
 ```
 
@@ -50,7 +50,7 @@ You / Team Lead
 
 | 组件 | 作用 |
 |------|------|
-| `scripts/vteam.py` | CLI：init / agent / gates |
+| `scripts/vteam.py` | CLI：init / agent / gates / handoff |
 | `references/*` | 模板 |
 | `Plan/team.json` | 身份与永久白名单 |
 | `Plan/agents/<id>/AGENT.md` | 个人边界 |
@@ -67,14 +67,16 @@ You / Team Lead
 
 1. 确认 ID  
 2. 读规则（根约束 + AGENT.md）  
-3. 写唯一活动计划  
-4. 独立 review  
-5. `check-plan`  
-6. 用户批准  
-7. 实现（完整功能 / 明确修复）  
-8. 风险分级测试  
-9. `check-scope`  
-10. 本地提交  
+3. `handoff list`（仅读返回路径，禁止扫 `active/`）  
+4. 写唯一活动计划（协作依赖表缓存 list）  
+5. 独立 review  
+6. `check-plan`  
+7. 用户批准  
+8. 实现（完整功能 / 明确修复）  
+9. 风险分级测试  
+10. `check-scope`  
+11. 本地提交  
+12. 需要时 `handoff create`；完成后关状态并 `cleanup`  
 
 硬停止：
 
@@ -112,12 +114,13 @@ You / Team Lead
 
 ### 协作文档
 
-只在真正需要另一 Agent 后续集成时写入：
+默认不建对接。仅当另一 Agent 必须后续集成时：
 
-- `Plan/collaboration/handoffs.md`
-- `Plan/collaboration/active/<id>-<topic>.md`
-
-完成或取消后物理删除，不归档。
+- 用 `handoff create` 登记并生成 `Plan/collaboration/active/<id>-<topic>.md`
+- 接收方用 `handoff list` 精确读取；禁止扫 `active/`
+- 真源表：`Plan/collaboration/handoffs.md`
+- 完成或取消后 `cleanup` 物理删除，不归档
+- `handoff doctor` 可查孤儿文档；open handoff 不阻止实现
 
 ## 生成结果
 
@@ -139,6 +142,7 @@ CLI：
 ```bash
 python scripts/vteam.py init
 python scripts/vteam.py agent
+python scripts/vteam.py handoff list|create|doctor
 python scripts/vteam.py check-plan
 python scripts/vteam.py check-scope
 python scripts/vteam.py cleanup
