@@ -78,8 +78,8 @@ python <skill-root>/scripts/vteam.py agent \
 2. 读取项目根 `AGENTS.md` 或 `CLAUDE.md`。
 3. 强制读取 `Plan/agents/<agent-id>/AGENT.md`；文件缺失时停止并要求先注册身份。
 4. 读取自己的 `PLAN.md` 和 `Plan/project.md`。
-5. 出现前后端、接口或架构协作时，优先读取 `Plan/collaboration/handoffs.md`，再按其登记路径读取与当前任务直接相关的临时文档；这不是唯一信息来源，代码、根目录、`doc/` 和 `docs/` 的可靠资料仍可读取。
-6. 不批量扫描 `Plan/collaboration/active/`，只读取当前任务需要的材料；默认忽略其他 Agent 历史，以及状态为 `completed` 或 `abandoned` 的计划。
+5. 运行 `python <skill-root>/scripts/vteam.py handoff list --project-root <project-root> --agent-id <agent-id>`；仅 Read 返回且 `doc_exists: true` 的 `doc` 路径。禁止批量扫描 `Plan/collaboration/active/`，禁止用 ls/glob 枚举对接正文。将 list 结果写入本 `PLAN.md`「协作依赖」表（会话缓存；真源仍是 `Plan/collaboration/handoffs.md`）。list 为空则跳过。
+6. 代码、根目录、`doc/` 和 `docs/` 的可靠资料仍可读取。默认忽略其他 Agent 历史，以及状态为 `completed` 或 `abandoned` 的计划。`handoffs.md` 仍是优先索引，但日常寻址以 `handoff list` 为准。
 
 ### 4. 编写单份计划并等待审批
 
@@ -141,14 +141,24 @@ python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> -
 
 ## 临时协作文档
 
-只有确实需要另一 Agent 后续集成的接口、数据结构、模块边界、运行方式或责任变化才建立临时对接材料：
+默认不建对接。只有另一已注册 Agent 必须消费本契约/接口才能完成用户可感知交付时，才建立临时对接：
 
-| 文档 | 当前职责 |
+```bash
+python <skill-root>/scripts/vteam.py handoff create \
+  --project-root <project-root> \
+  --from <proposer-id> --to <receiver-id> \
+  --topic <slug> --deliverable "..." --acceptance "..."
+```
+
+| 文档 / 命令 | 当前职责 |
 |---|---|
-| `Plan/collaboration/handoffs.md` | 当前仍未完成的跨 Agent 交付物、接收者、文档路径和验收条件；协作时的优先索引 |
-| `Plan/collaboration/active/<handoff-id>-<topic>.md` | 临时架构、前后端或接口对接材料；必须在 handoff 中登记后才由接收者使用 |
+| `handoff list` | 接收/提出方精确列出应读路径；启动协作时必用 |
+| `handoff create` | 一键登记 + 生成 `active/<id>-<topic>.md`；禁止手搓未登记文件 |
+| `handoff doctor` | 报告孤儿 active、缺失路径、无效 agent-id；不默认删除 |
+| `Plan/collaboration/handoffs.md` | 对接真源表；优先索引 |
+| `Plan/collaboration/active/<handoff-id>-<topic>.md` | 临时正文；须经 create 或表登记后才由接收者使用 |
 
-不要为普通新任务创建对接材料，也不要把临时文档写成聊天记录。新建的开发对接文档不得写入项目根目录、`doc/` 或 `docs/`；这些位置的现有资料可以作为补充参考。对接验证完成或取消后先标为 `completed` 或 `cancelled`，再由 `cleanup` 物理删除文档和关闭条目，不归档临时材料。
+仅自用说明写在自己的 `PLAN.md`。简单跨模块走一次性授权，不建 handoff。同 from+to+topic 已有 open/in-progress 时修订旧文档，不新建。验收后把状态改为 `completed` 或 `cancelled`（可直接改表）；功能完成后禁止再写归档、对接总结或多余对接文档。`cleanup` 再物理删除文档和关闭条目，不归档临时材料。open handoff 不阻止实现；`check-plan` 不因 handoff 失败。新建对接不得写入项目根目录、`doc/` 或 `docs/`。
 
 ## 安全清理
 
@@ -180,12 +190,12 @@ python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --age
 
 ## 资源
 
-- `scripts/vteam.py`：`init`、`agent`、`check-plan`、`check-scope`、`cleanup` 统一入口。
+- `scripts/vteam.py`：`init`、`agent`、`check-plan`、`check-scope`、`cleanup`、`handoff list|show|create|doctor` 统一入口。
 - `references/root-agents-template.md`：Codex 项目根约束模板。
 - `references/root-claude-template.md`：Claude 项目根约束模板。
 - `references/personal-agent-template.md`：个人身份、边界和行为模板。
 - `references/quick-onboarding-template.md`：从用户身份和业务范围生成个人约束的提示模板。
-- `references/plan-template.md`：唯一活动计划模板。
+- `references/plan-template.md`：唯一活动计划模板（含协作依赖缓存表）。
 - `references/project-template.md`：项目当前态模板。
 - `references/handoffs-template.md`：开放对接当前态模板。
 - `references/team-template.json`：团队配置初始结构。

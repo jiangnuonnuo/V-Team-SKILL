@@ -26,11 +26,12 @@
 2. 本文件 `Plan/agents/{{AGENT_ID}}/AGENT.md`。
 3. 唯一活动计划 `Plan/agents/{{AGENT_ID}}/PLAN.md`。
 4. `Plan/project.md`。
-5. 下列与当前任务直接相关的当前态协作文档：
+5. 运行 `handoff list --agent-id {{AGENT_ID}}`，仅 Read 返回且存在的 `doc` 路径；把结果写入本 PLAN「协作依赖」表。禁止 ls/glob 批量扫描 `Plan/collaboration/active/`。
+6. 下列与当前任务直接相关的当前态协作文档（补充，不是替代 list）：
 
 {{COLLABORATION_DOCS}}
 
-处理前后端、接口或架构协作时，优先查看 `Plan/collaboration/handoffs.md`，再按其中路径读取相关的 `Plan/collaboration/active/` 文档；这只是优先索引，不限制读取代码、根目录、`doc/` 或 `docs/` 中的可靠资料。不要批量扫描 `Plan/collaboration/active/`，只读取与当前任务直接相关的材料。
+`Plan/collaboration/handoffs.md` 是对接真源；日常寻址以 `handoff list` 为准。代码、根目录、`doc/` 或 `docs/` 中的可靠资料仍可读取。
 
 ## 计划、测试与提交
 
@@ -48,7 +49,7 @@
 ## 协作责任
 
 1. 优先在负责模块内工作，但不要把边界理解为禁止跨模块修改。
-2. 只有确实需要另一 Agent 后续集成的接口、数据结构、模块边界或依赖才建立临时对接文档。
-3. 临时对接文档只能写入 `Plan/collaboration/active/`，并在 `Plan/collaboration/handoffs.md` 登记路径、接收者、验收条件和状态；不得在项目根目录、`doc/` 或 `docs/` 创建此类材料。
+2. 默认不建对接。仅当另一已注册 Agent 必须消费契约时用 `handoff create`；禁止手搓未登记的 `Plan/collaboration/active/` 文件。
+3. 临时对接只能落在 `Plan/collaboration/active/` 并登记到 `handoffs.md`；不得在项目根目录、`doc/` 或 `docs/` 创建此类材料。
 4. 简单的一次性跨模块修改只走提交前一次性授权，不强制创建 handoff。
-5. 对接验证完成后将 handoff 标为 `completed` 或 `cancelled`；完成或废弃计划满足证据条件后运行 `cleanup`，删除对应临时文档和关闭条目。
+5. 验收后将 handoff 标为 `completed` 或 `cancelled`；功能完成后禁止再写归档或对接总结。计划满足证据条件后运行 `cleanup`。open handoff 不阻止实现。

@@ -889,8 +889,313 @@ class CleanupTests(VTeamTestCase):
         self.assertEqual(1, result.returncode)
         self.assertIn("提交不存在", result.stderr)
 
+    def test_cleanup_mentions_orphans_without_failing(self) -> None:
+        """description: cleanup 成功时若存在未登记 active 文件则提示且退出码仍为 0。"""
+        self.write_plan(
+            "completed",
+            [("T1", "完成权限功能", "completed", "OK", self.commit_hash)],
+        )
+        orphan = (
+            self.project_root
+            / "Plan"
+            / "collaboration"
+            / "active"
+            / "orphan-note.md"
+        )
+        orphan.write_text("# orphan\n", encoding="utf-8")
+
+        result = self.run_cleanup()
+
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn("未登记的 active 文档", result.stderr)
+        self.assertTrue(orphan.is_file())
+
+
+class HandoffCommandTests(VTeamTestCase):
+    """description: 验证 handoff list/show/create/doctor 的精确读取与创建卫生。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.assertEqual(
+            0,
+            self.register_agent("frontend-1", role="frontend").returncode,
+        )
+        self.assertEqual(
+            0,
+            self.register_agent("other-1", role="backend").returncode,
+        )
+
+    @property
+    def handoffs_path(self) -> Path:
+        return self.project_root / "Plan" / "collaboration" / "handoffs.md"
+
+    @property
+    def active_root(self) -> Path:
+        return self.project_root / "Plan" / "collaboration" / "active"
+
+    def write_handoffs(self, rows: list[str]) -> None:
+        header = (
+            "# 当前跨 Agent 对接\n\n"
+            "| ID | 提出者 | 接收者 | 对接文档 | 交付物 | 验收条件 | 状态 |\n"
+            "|---|---|---|---|---|---|---|\n"
+        )
+        body = "\n".join(rows) + ("\n" if rows else "")
+        self.handoffs_path.write_text(header + body, encoding="utf-8")
+
+    def test_handoff_list_filters_by_agent_and_active_status(self) -> None:
+        self.active_root.mkdir(parents=True, exist_ok=True)
+        (self.active_root / "H1-login.md").write_text("# H1\n", encoding="utf-8")
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | frontend-1 | Plan/collaboration/active/H1-login.md | 登录 | 联调 | open |",
+                "| H2 | backend-1 | other-1 | Plan/collaboration/active/H2-x.md | 其他 | 联调 | open |",
+                "| H3 | backend-1 | frontend-1 | Plan/collaboration/active/H3-old.md | 旧 | 无 | completed |",
+                "| H4 | frontend-1 | backend-1 | Plan/collaboration/active/H4-ui.md | UI | 可见 | open |",
+            ]
+        )
+
+        result = self.run_cli(
+            "handoff",
+            "list",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "frontend-1",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("HANDOFF H1", result.stdout)
+        self.assertIn("HANDOFF H4", result.stdout)
+        self.assertNotIn("HANDOFF H2", result.stdout)
+        self.assertNotIn("HANDOFF H3", result.stdout)
+
+    def test_handoff_list_role_receiver_only(self) -> None:
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | frontend-1 | - | 登录 | 联调 | open |",
+                "| H4 | frontend-1 | backend-1 | - | UI | 可见 | open |",
+            ]
+        )
+
+        result = self.run_cli(
+            "handoff",
+            "list",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "frontend-1",
+            "--role",
+            "receiver",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("HANDOFF H1", result.stdout)
+        self.assertNotIn("HANDOFF H4", result.stdout)
+
+    def test_handoff_list_reports_doc_exists(self) -> None:
+        self.active_root.mkdir(parents=True, exist_ok=True)
+        (self.active_root / "H1-login.md").write_text("# H1\n", encoding="utf-8")
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | frontend-1 | Plan/collaboration/active/H1-login.md | 登录 | 联调 | open |",
+                "| H2 | backend-1 | frontend-1 | Plan/collaboration/active/H2-missing.md | 缺 | 联调 | open |",
+            ]
+        )
+
+        result = self.run_cli(
+            "handoff",
+            "list",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "frontend-1",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.stdout, r"HANDOFF H1[\s\S]*doc_exists: true")
+        self.assertRegex(result.stdout, r"HANDOFF H2[\s\S]*doc_exists: false")
+
+    def test_handoff_show_prints_single_row(self) -> None:
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | frontend-1 | - | 登录接口 | 联调通过 | open |",
+            ]
+        )
+
+        ok = self.run_cli(
+            "handoff",
+            "show",
+            "--project-root",
+            str(self.project_root),
+            "--id",
+            "H1",
+        )
+        missing = self.run_cli(
+            "handoff",
+            "show",
+            "--project-root",
+            str(self.project_root),
+            "--id",
+            "H9",
+        )
+
+        self.assertEqual(0, ok.returncode, ok.stderr)
+        self.assertIn("HANDOFF H1", ok.stdout)
+        self.assertIn("登录接口", ok.stdout)
+        self.assertEqual(1, missing.returncode)
+        self.assertIn("未找到对接 ID", missing.stderr)
+
+    def test_handoff_create_registers_row_and_writes_active_document(self) -> None:
+        result = self.run_cli(
+            "handoff",
+            "create",
+            "--project-root",
+            str(self.project_root),
+            "--from",
+            "backend-1",
+            "--to",
+            "frontend-1",
+            "--topic",
+            "login-api",
+            "--deliverable",
+            "登录接口契约",
+            "--acceptance",
+            "前端联调通过",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("H1", result.stdout)
+        handoffs = self.handoffs_path.read_text(encoding="utf-8")
+        self.assertIn("Plan/collaboration/active/H1-login-api.md", handoffs)
+        self.assertIn("frontend-1", handoffs)
+        document = self.active_root / "H1-login-api.md"
+        self.assertTrue(document.is_file())
+        self.assertIn("登录接口契约", document.read_text(encoding="utf-8"))
+
+    def test_handoff_create_rejects_unknown_receiver(self) -> None:
+        result = self.run_cli(
+            "handoff",
+            "create",
+            "--project-root",
+            str(self.project_root),
+            "--from",
+            "backend-1",
+            "--to",
+            "ghost-1",
+            "--topic",
+            "x",
+            "--deliverable",
+            "d",
+            "--acceptance",
+            "a",
+        )
+
+        self.assertEqual(1, result.returncode)
+        self.assertIn("ghost-1", result.stderr)
+
+    def test_handoff_create_rejects_duplicate_open_same_topic(self) -> None:
+        args = [
+            "handoff",
+            "create",
+            "--project-root",
+            str(self.project_root),
+            "--from",
+            "backend-1",
+            "--to",
+            "frontend-1",
+            "--topic",
+            "login-api",
+            "--deliverable",
+            "登录",
+            "--acceptance",
+            "联调",
+        ]
+        first = self.run_cli(*args)
+        second = self.run_cli(*args)
+
+        self.assertEqual(0, first.returncode, first.stderr)
+        self.assertEqual(2, second.returncode, second.stderr)
+        self.assertIn("已存在相同主题", second.stderr)
+        files = list(self.active_root.glob("*-login-api.md"))
+        self.assertEqual(1, len(files))
+
+    def test_handoff_create_auto_increments_id(self) -> None:
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | frontend-1 | - | 旧 | 无 | completed |",
+            ]
+        )
+
+        result = self.run_cli(
+            "handoff",
+            "create",
+            "--project-root",
+            str(self.project_root),
+            "--from",
+            "backend-1",
+            "--to",
+            "frontend-1",
+            "--topic",
+            "next-api",
+            "--deliverable",
+            "下一接口",
+            "--acceptance",
+            "通过",
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("H2", result.stdout)
+        self.assertTrue((self.active_root / "H2-next-api.md").is_file())
+
+    def test_handoff_doctor_reports_orphan_active_files(self) -> None:
+        self.active_root.mkdir(parents=True, exist_ok=True)
+        (self.active_root / "orphan.md").write_text("# x\n", encoding="utf-8")
+
+        result = self.run_cli(
+            "handoff",
+            "doctor",
+            "--project-root",
+            str(self.project_root),
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("orphan:", result.stderr)
+        self.assertIn("orphan.md", result.stderr)
+
+    def test_handoff_doctor_reports_invalid_receiver(self) -> None:
+        self.write_handoffs(
+            [
+                "| H1 | backend-1 | not-real | - | x | y | open |",
+            ]
+        )
+
+        result = self.run_cli(
+            "handoff",
+            "doctor",
+            "--project-root",
+            str(self.project_root),
+        )
+
+        self.assertEqual(2, result.returncode)
+        self.assertIn("invalid_agent", result.stderr)
+        self.assertIn("not-real", result.stderr)
+
+    def test_handoff_doctor_clean_when_empty(self) -> None:
+        result = self.run_cli(
+            "handoff",
+            "doctor",
+            "--project-root",
+            str(self.project_root),
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("未发现问题", result.stdout)
+
 
 class SkillContractTests(VTeamTestCase):
+
     """description: 验证技能触发信息、强制工作流、资源清理和技能库索引保持一致。"""
 
     def test_skill_description_matches_multi_agent_project_workflow(self) -> None:
@@ -1005,6 +1310,45 @@ class SkillContractTests(VTeamTestCase):
         ]
         for fragment in required_fragments:
             self.assertIn(fragment, content)
+
+    def test_skill_documents_handoff_list_first_and_no_active_scan(self) -> None:
+        """description: 技能要求先 handoff list，禁止扫描 active，并维护协作依赖缓存。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        for fragment in [
+            "handoff list",
+            "禁止批量扫描 `Plan/collaboration/active/`",
+            "协作依赖",
+            "handoff create",
+            "handoff doctor",
+        ]:
+            self.assertIn(fragment, content)
+
+    def test_skill_handoff_create_default_no_and_no_impl_gate(self) -> None:
+        """description: 默认少建对接；open handoff 不阻止实现与 check-plan。"""
+        content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("默认不建对接", content)
+        self.assertIn("open handoff 不阻止实现", content)
+        self.assertIn("不因 handoff 失败", content)
+
+    def test_plan_template_has_collaboration_dependency_table(self) -> None:
+        """description: 计划模板含协作依赖表作为 handoff list 会话缓存。"""
+        content = (REPOSITORY_ROOT / "references" / "plan-template.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("## 协作依赖", content)
+        self.assertIn("Handoff ID", content)
+        self.assertIn("handoff list", content)
+
+    def test_root_and_personal_templates_require_handoff_list(self) -> None:
+        """description: 根约束与个人模板要求 handoff list 并禁止扫 active。"""
+        for relative_path in [
+            "references/root-agents-template.md",
+            "references/root-claude-template.md",
+            "references/personal-agent-template.md",
+        ]:
+            content = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("handoff list", content, relative_path)
+            self.assertIn("Plan/collaboration/active/", content, relative_path)
 
     def test_old_scripts_and_version_templates_are_removed(self) -> None:
         """description: 输入重构后的技能目录；输出只保留统一入口和新当前态模板。"""

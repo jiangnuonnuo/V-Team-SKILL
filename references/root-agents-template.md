@@ -20,7 +20,7 @@
 
 ## 上下文规则
 
-1. 处理前后端、接口或架构协作时，优先查看 `Plan/collaboration/handoffs.md`，再按其中路径读取相关的 `Plan/collaboration/active/` 文档；这只是优先索引，不限制读取代码、根目录、`doc/` 或 `docs/` 中的可靠资料。
-2. 不批量扫描 `Plan/collaboration/active/`，只读取与当前任务直接相关且由 handoff 指向的文档。
-3. 新建的临时对接材料只写入 `Plan/collaboration/active/`，并登记到 handoff；不得在项目根目录、`doc/` 或 `docs/` 创建此类开发对接文档。
-4. 对接完成后将 handoff 标为 `completed` 或 `cancelled`，由 `cleanup` 删除对应临时文件和关闭条目。
+1. 启动后运行 `handoff list --project-root <root> --agent-id <自己>`，仅 Read 返回的 `doc` 路径；禁止 ls/glob 批量扫描 `Plan/collaboration/active/`。`Plan/collaboration/handoffs.md` 是真源，list 是日常寻址方式。
+2. 将 list 结果写入自己 `PLAN.md` 的「协作依赖」表。list 为空则跳过。代码、根目录、`doc/` 或 `docs/` 中的可靠资料仍可读取。
+3. 默认不建对接。仅当另一已注册 Agent 必须消费契约时用 `handoff create`；禁止手搓未登记 active 文件；不得在项目根目录、`doc/` 或 `docs/` 创建对接文档。
+4. 验收后将状态标为 `completed` 或 `cancelled`，由 `cleanup` 删除临时文件。功能完成后禁止再写归档或对接总结。open handoff 不阻止实现。

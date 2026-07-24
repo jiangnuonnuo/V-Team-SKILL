@@ -18,8 +18,18 @@ VALID_RUNTIMES = {"codex", "claude"}
 TEMPLATE_MARKER_PATTERN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
 PLAN_PATH_PREFIX = "Plan/"
 ACTIVE_HANDOFF_DOCUMENT_PREFIX = "Plan/collaboration/active/"
+HANDOFFS_RELATIVE_PATH = "Plan/collaboration/handoffs.md"
+ACTIVE_HANDOFF_STATUSES = frozenset({"open", "in-progress"})
+CLOSED_HANDOFF_STATUSES = frozenset({"completed", "cancelled"})
+VALID_HANDOFF_STATUSES = ACTIVE_HANDOFF_STATUSES | CLOSED_HANDOFF_STATUSES
+TOPIC_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+HANDOFF_ID_PATTERN = re.compile(r"^H(\d+)$", re.IGNORECASE)
 LOCAL_EXCLUDE_BEGIN = "# v-team local collaboration artifacts: begin"
 LOCAL_EXCLUDE_END = "# v-team local collaboration artifacts: end"
+
+
+class HandoffRejected(Exception):
+    """description: handoff 业务拒绝（例如重复 open），对应 CLI 退出码 2。"""
 
 
 def write_text(path: Path, content: str, overwrite: bool = True) -> None:
@@ -682,10 +692,8 @@ def validate_cleanup_state(
         if not local_commit_exists(project_root, task["commit"]):
             raise ValueError(f"已完成任务 {task['id']} 的本地提交不存在: {task['commit']}")
 
-    valid_handoff_statuses = {"open", "in-progress", "completed", "cancelled"}
-    active_statuses = {"open", "in-progress"}
     for handoff in parse_handoff_rows(handoffs_text):
-        if handoff["status"] not in valid_handoff_statuses:
+        if handoff["status"] not in VALID_HANDOFF_STATUSES:
             raise ValueError(
                 f"对接 {handoff['id']} 使用未知状态: {handoff['status']}"
             )
@@ -693,7 +701,7 @@ def validate_cleanup_state(
             handoff["proposer"],
             handoff["receiver"],
         }
-        if involves_agent and handoff["status"] in active_statuses:
+        if involves_agent and handoff["status"] in ACTIVE_HANDOFF_STATUSES:
             raise ValueError(
                 f"存在当前 Agent 参与的未关闭对接 {handoff['id']}: {handoff['status']}"
             )
@@ -768,11 +776,10 @@ def remove_closed_handoffs(handoffs_text: str) -> tuple[str, list[dict[str, str]
     Raises:
         ValueError: 表格格式错误。
     """
-    closed_statuses = {"completed", "cancelled"}
     closed_handoffs = [
         handoff
         for handoff in parse_handoff_rows(handoffs_text)
-        if handoff["status"] in closed_statuses
+        if handoff["status"] in CLOSED_HANDOFF_STATUSES
     ]
     closed_rows = {handoff["raw_line"] for handoff in closed_handoffs}
     active_lines = [
@@ -820,6 +827,336 @@ def remove_closed_handoff_documents(
     return deleted_paths
 
 
+def handoffs_file_path(project_root: Path) -> Path:
+    """description: 返回项目 handoffs.md 路径。"""
+    return project_root / Path(HANDOFFS_RELATIVE_PATH)
+
+
+def active_handoff_directory(project_root: Path) -> Path:
+    """description: 返回临时对接文档目录。"""
+    return project_root / "Plan" / "collaboration" / "active"
+
+
+def load_handoffs_text(project_root: Path) -> str:
+    """description: 读取 handoffs.md；缺失时抛出 FileNotFoundError。"""
+    path = handoffs_file_path(project_root)
+    if not path.is_file():
+        raise FileNotFoundError(f"缺少协作文档: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def require_registered_agent(project_root: Path, agent_id: str) -> str:
+    """description: 校验 agent-id 已注册并返回规范化 ID。"""
+    normalized = validate_agent_id(agent_id)
+    team = load_team(project_root)
+    registered_ids = {agent["id"] for agent in team["agents"]}
+    if normalized not in registered_ids:
+        raise ValueError(f"team.json 中不存在 agent-id: {normalized}")
+    return normalized
+
+
+def parse_status_filter(raw_statuses: str | None) -> set[str]:
+    """description: 解析 list 的 status 过滤参数。"""
+    if raw_statuses is None or not raw_statuses.strip():
+        return set(ACTIVE_HANDOFF_STATUSES)
+    statuses = {part.strip() for part in raw_statuses.split(",") if part.strip()}
+    invalid = statuses - VALID_HANDOFF_STATUSES
+    if invalid:
+        joined = ", ".join(sorted(invalid))
+        raise ValueError(f"未知 handoff 状态: {joined}")
+    return statuses
+
+
+def document_exists(project_root: Path, document_path: str) -> bool:
+    """description: 判断登记的对接文档是否存在于磁盘。"""
+    if document_path in {"", "-", "无", "无。"}:
+        return False
+    return (project_root / document_path).is_file()
+
+
+def list_handoffs_for_agent(
+    project_root: Path,
+    agent_id: str,
+    role: str = "any",
+    statuses: set[str] | None = None,
+) -> list[dict[str, str]]:
+    """description: 按 Agent 与状态过滤活动对接行，并标注参与角色与文档是否存在。
+
+    Args:
+        project_root: 项目根目录。
+        agent_id: 当前 Agent ID。
+        role: receiver、proposer 或 any。
+        statuses: 状态集合；默认 open 与 in-progress。
+
+    Returns:
+        过滤后的 handoff 字典列表（含 role、doc_exists 字段）。
+    """
+    normalized_agent_id = require_registered_agent(project_root, agent_id)
+    if role not in {"any", "receiver", "proposer"}:
+        raise ValueError(f"未知 role: {role}，应为 receiver、proposer 或 any")
+    status_filter = set(ACTIVE_HANDOFF_STATUSES) if statuses is None else statuses
+    rows: list[dict[str, str]] = []
+    for handoff in parse_handoff_rows(load_handoffs_text(project_root)):
+        if handoff["status"] not in status_filter:
+            continue
+        is_receiver = handoff["receiver"] == normalized_agent_id
+        is_proposer = handoff["proposer"] == normalized_agent_id
+        if role == "receiver" and not is_receiver:
+            continue
+        if role == "proposer" and not is_proposer:
+            continue
+        if role == "any" and not (is_receiver or is_proposer):
+            continue
+        if is_receiver and is_proposer:
+            participation = "both"
+        elif is_receiver:
+            participation = "receiver"
+        else:
+            participation = "proposer"
+        enriched = dict(handoff)
+        enriched["role"] = participation
+        enriched["doc_exists"] = (
+            "true"
+            if document_exists(project_root, handoff["document_path"])
+            else "false"
+        )
+        rows.append(enriched)
+    return rows
+
+
+def format_handoff_list(rows: Sequence[dict[str, str]]) -> str:
+    """description: 将 handoff 列表格式化为 Agent 可抄写进 PLAN 的稳定文本。"""
+    if not rows:
+        return "没有匹配的对接事项。\n"
+    blocks: list[str] = []
+    for handoff in rows:
+        blocks.append(
+            "\n".join(
+                [
+                    f"HANDOFF {handoff['id']} status={handoff['status']} "
+                    f"role={handoff['role']}",
+                    f"  from: {handoff['proposer']}",
+                    f"  to: {handoff['receiver']}",
+                    f"  doc: {handoff['document_path']}",
+                    f"  doc_exists: {handoff['doc_exists']}",
+                    f"  deliverable: {handoff['deliverable']}",
+                    f"  acceptance: {handoff['acceptance']}",
+                ]
+            )
+        )
+    return "\n\n".join(blocks) + "\n"
+
+
+def show_handoff(project_root: Path, handoff_id: str) -> dict[str, str]:
+    """description: 按 ID 返回单条 handoff；不存在时抛出 ValueError。"""
+    target = handoff_id.strip()
+    for handoff in parse_handoff_rows(load_handoffs_text(project_root)):
+        if handoff["id"] == target:
+            enriched = dict(handoff)
+            enriched["role"] = "-"
+            enriched["doc_exists"] = (
+                "true"
+                if document_exists(project_root, handoff["document_path"])
+                else "false"
+            )
+            return enriched
+    raise ValueError(f"未找到对接 ID: {target}")
+
+
+def validate_topic(topic: str) -> str:
+    """description: 校验对接主题 slug。"""
+    normalized = topic.strip()
+    if not TOPIC_PATTERN.fullmatch(normalized):
+        raise ValueError(
+            "topic 必须为 1–64 位、以字母或数字开头，且仅含字母、数字、_ 或 -"
+        )
+    return normalized
+
+
+def next_handoff_id(existing_rows: Sequence[dict[str, str]]) -> str:
+    """description: 生成下一个 Hn 形式的对接 ID。"""
+    max_number = 0
+    for handoff in existing_rows:
+        match = HANDOFF_ID_PATTERN.fullmatch(handoff["id"])
+        if match:
+            max_number = max(max_number, int(match.group(1)))
+    return f"H{max_number + 1}"
+
+
+def build_handoff_document_body(
+    handoff_id: str,
+    proposer: str,
+    receiver: str,
+    topic: str,
+    deliverable: str,
+    acceptance: str,
+) -> str:
+    """description: 生成临时对接文档最小正文。"""
+    return (
+        f"# 对接 {handoff_id}: {topic}\n\n"
+        f"- 提出者: `{proposer}`\n"
+        f"- 接收者: `{receiver}`\n"
+        f"- 交付物: {deliverable}\n"
+        f"- 验收条件: {acceptance}\n\n"
+        "## 接口 / 契约正文\n\n"
+        "（由提出者填写；接收者只读本文件中与集成相关的约定。）\n\n"
+        "## 修订记录\n\n"
+        f"- 创建: {handoff_id} open\n"
+    )
+
+
+def append_handoff_table_row(handoffs_text: str, row_line: str) -> str:
+    """description: 在 handoffs.md 表格末尾追加一行数据。"""
+    lines = handoffs_text.splitlines()
+    last_table_index = -1
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("|") and stripped.endswith("|"):
+            last_table_index = index
+    if last_table_index < 0:
+        raise ValueError("handoffs.md 缺少可追加的对接表格")
+    lines.insert(last_table_index + 1, row_line)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def create_handoff(
+    project_root: Path,
+    proposer: str,
+    receiver: str,
+    topic: str,
+    deliverable: str,
+    acceptance: str,
+    handoff_id: str | None = None,
+) -> dict[str, str]:
+    """description: 登记对接并写入 active 临时文档。
+
+    Raises:
+        HandoffRejected: 同 from+to+topic 已有 open/in-progress，或 ID 冲突。
+        ValueError: 参数非法或 Agent 未注册。
+    """
+    proposer_id = require_registered_agent(project_root, proposer)
+    receiver_id = require_registered_agent(project_root, receiver)
+    topic_slug = validate_topic(topic)
+    deliverable_text = deliverable.strip()
+    acceptance_text = acceptance.strip()
+    if not deliverable_text:
+        raise ValueError("deliverable 不能为空")
+    if not acceptance_text:
+        raise ValueError("acceptance 不能为空")
+
+    handoffs_text = load_handoffs_text(project_root)
+    existing = parse_handoff_rows(handoffs_text)
+    for handoff in existing:
+        if (
+            handoff["proposer"] == proposer_id
+            and handoff["receiver"] == receiver_id
+            and handoff["status"] in ACTIVE_HANDOFF_STATUSES
+        ):
+            existing_topic = ""
+            doc = handoff["document_path"]
+            if doc.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX) and doc.endswith(".md"):
+                name = doc[len(ACTIVE_HANDOFF_DOCUMENT_PREFIX) : -3]
+                prefix = f"{handoff['id']}-"
+                if name.startswith(prefix):
+                    existing_topic = name[len(prefix) :]
+            if existing_topic == topic_slug:
+                raise HandoffRejected(
+                    f"已存在相同主题的活动对接 {handoff['id']}: "
+                    f"{handoff['document_path']}；请修订旧文档，不要新建"
+                )
+
+    if handoff_id is None or not handoff_id.strip():
+        new_id = next_handoff_id(existing)
+    else:
+        new_id = handoff_id.strip()
+        if any(row["id"] == new_id for row in existing):
+            raise HandoffRejected(f"对接 ID 已存在: {new_id}")
+
+    document_path = f"{ACTIVE_HANDOFF_DOCUMENT_PREFIX}{new_id}-{topic_slug}.md"
+    absolute_document = project_root / document_path
+    if absolute_document.exists():
+        raise HandoffRejected(f"对接文档已存在: {document_path}")
+
+    row_line = (
+        f"| {new_id} | {proposer_id} | {receiver_id} | {document_path} | "
+        f"{deliverable_text} | {acceptance_text} | open |"
+    )
+    updated_text = append_handoff_table_row(handoffs_text, row_line)
+    body = build_handoff_document_body(
+        new_id,
+        proposer_id,
+        receiver_id,
+        topic_slug,
+        deliverable_text,
+        acceptance_text,
+    )
+    write_text(handoffs_file_path(project_root), updated_text)
+    write_text(absolute_document, body)
+    return {
+        "id": new_id,
+        "proposer": proposer_id,
+        "receiver": receiver_id,
+        "document_path": document_path,
+        "deliverable": deliverable_text,
+        "acceptance": acceptance_text,
+        "status": "open",
+        "topic": topic_slug,
+    }
+
+
+def collect_handoff_doctor_issues(project_root: Path) -> list[str]:
+    """description: 收集 handoff 卫生问题（孤儿文件、缺失路径、无效 Agent）。"""
+    team = load_team(project_root)
+    registered_ids = {agent["id"] for agent in team["agents"]}
+    handoffs_text = load_handoffs_text(project_root)
+    rows = parse_handoff_rows(handoffs_text)
+    registered_docs: set[str] = set()
+    issues: list[str] = []
+
+    for handoff in rows:
+        doc = handoff["document_path"]
+        if doc not in {"", "-", "无", "无。"}:
+            registered_docs.add(doc)
+            if not document_exists(project_root, doc):
+                issues.append(f"missing: {handoff['id']} -> {doc}")
+        if handoff["proposer"] not in registered_ids:
+            issues.append(
+                f"invalid_agent: {handoff['id']} proposer={handoff['proposer']}"
+            )
+        if handoff["receiver"] not in registered_ids:
+            issues.append(
+                f"invalid_agent: {handoff['id']} receiver={handoff['receiver']}"
+            )
+
+    active_dir = active_handoff_directory(project_root)
+    if active_dir.is_dir():
+        for path in sorted(active_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(project_root).as_posix()
+            if relative not in registered_docs:
+                issues.append(f"orphan: {relative}")
+    return issues
+
+
+def format_doctor_report(issues: Sequence[str]) -> str:
+    """description: 格式化 doctor 报告文本。"""
+    if not issues:
+        return "handoff doctor: 未发现问题。\n"
+    lines = ["handoff doctor: 发现问题:"]
+    lines.extend(f"- {issue}" for issue in issues)
+    return "\n".join(lines) + "\n"
+
+
+def count_orphan_active_documents(project_root: Path) -> int:
+    """description: 统计 active 目录中未登记的文件数量。"""
+    return sum(
+        1
+        for issue in collect_handoff_doctor_issues(project_root)
+        if issue.startswith("orphan:")
+    )
+
+
 def cleanup_agent_plan(project_root: Path, agent_id: str) -> list[Path]:
     """description: 重置完成或废弃计划，并删除已关闭 handoff 的临时文档。
 
@@ -848,7 +1185,7 @@ def cleanup_agent_plan(project_root: Path, agent_id: str) -> list[Path]:
         / normalized_agent_id
         / "PLAN.md"
     )
-    handoffs_path = project_root / "Plan" / "collaboration" / "handoffs.md"
+    handoffs_path = handoffs_file_path(project_root)
     if not handoffs_path.is_file():
         raise FileNotFoundError(f"缺少协作文档: {handoffs_path}")
 
@@ -1240,7 +1577,7 @@ def build_parser() -> argparse.ArgumentParser:
         无。
 
     Returns:
-        包含 init、agent、check-plan、check-scope 与 cleanup 子命令的 ArgumentParser。
+        包含 init、agent、check-plan、check-scope、cleanup 与 handoff 子命令的 ArgumentParser。
 
     Raises:
         无。
@@ -1297,6 +1634,73 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cleanup_parser.add_argument("--project-root", required=True, type=Path)
     cleanup_parser.add_argument("--agent-id", required=True)
+
+    handoff_parser = subparsers.add_parser(
+        "handoff",
+        help="精确列出、创建或检查跨 Agent 临时对接",
+    )
+    handoff_subparsers = handoff_parser.add_subparsers(
+        dest="handoff_command",
+        required=True,
+    )
+
+    handoff_list = handoff_subparsers.add_parser(
+        "list",
+        help="按 Agent 精确列出应读的对接文档",
+    )
+    handoff_list.add_argument("--project-root", required=True, type=Path)
+    handoff_list.add_argument("--agent-id", required=True)
+    handoff_list.add_argument(
+        "--role",
+        choices=["any", "receiver", "proposer"],
+        default="any",
+        help="过滤参与角色；默认 any",
+    )
+    handoff_list.add_argument(
+        "--status",
+        default="open,in-progress",
+        help="逗号分隔状态过滤；默认 open,in-progress",
+    )
+
+    handoff_show = handoff_subparsers.add_parser(
+        "show",
+        help="按 ID 查看单条对接登记",
+    )
+    handoff_show.add_argument("--project-root", required=True, type=Path)
+    handoff_show.add_argument("--id", required=True, dest="handoff_id")
+
+    handoff_create = handoff_subparsers.add_parser(
+        "create",
+        help="一键登记对接并生成 active 文档",
+    )
+    handoff_create.add_argument("--project-root", required=True, type=Path)
+    handoff_create.add_argument(
+        "--from",
+        required=True,
+        dest="proposer",
+        help="提出者 agent-id",
+    )
+    handoff_create.add_argument(
+        "--to",
+        required=True,
+        dest="receiver",
+        help="接收者 agent-id",
+    )
+    handoff_create.add_argument("--topic", required=True)
+    handoff_create.add_argument("--deliverable", required=True)
+    handoff_create.add_argument("--acceptance", required=True)
+    handoff_create.add_argument(
+        "--id",
+        dest="handoff_id",
+        help="可选对接 ID；默认自动生成 Hn",
+    )
+
+    handoff_doctor = handoff_subparsers.add_parser(
+        "doctor",
+        help="检查孤儿文档、缺失路径与无效 Agent",
+    )
+    handoff_doctor.add_argument("--project-root", required=True, type=Path)
+
     return parser
 
 
@@ -1307,7 +1711,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: 不含程序名的命令行参数；为空时读取 sys.argv。
 
     Returns:
-        0 表示成功，1 表示已知配置或文件错误。
+        0 表示成功，1 表示已知配置或文件错误，2 表示范围越界或 handoff 业务拒绝/doctor 发现问题。
 
     Raises:
         SystemExit: argparse 在参数格式错误时终止并返回标准退出码。
@@ -1388,7 +1792,60 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"计划已重置，已清理对接文档: {paths_text}")
             else:
                 print("计划已重置，没有需要清理的对接文档")
+            orphan_count = count_orphan_active_documents(arguments.project_root)
+            if orphan_count:
+                print(
+                    f"提示: 发现 {orphan_count} 个未登记的 active 文档，"
+                    "可运行 handoff doctor 查看",
+                    file=sys.stderr,
+                )
             return 0
+
+        if arguments.command == "handoff":
+            if arguments.handoff_command == "list":
+                rows = list_handoffs_for_agent(
+                    project_root=arguments.project_root,
+                    agent_id=arguments.agent_id,
+                    role=arguments.role,
+                    statuses=parse_status_filter(arguments.status),
+                )
+                print(format_handoff_list(rows), end="")
+                return 0
+
+            if arguments.handoff_command == "show":
+                row = show_handoff(
+                    project_root=arguments.project_root,
+                    handoff_id=arguments.handoff_id,
+                )
+                print(format_handoff_list([row]), end="")
+                return 0
+
+            if arguments.handoff_command == "create":
+                created = create_handoff(
+                    project_root=arguments.project_root,
+                    proposer=arguments.proposer,
+                    receiver=arguments.receiver,
+                    topic=arguments.topic,
+                    deliverable=arguments.deliverable,
+                    acceptance=arguments.acceptance,
+                    handoff_id=arguments.handoff_id,
+                )
+                print(
+                    f"对接已创建: {created['id']} -> {created['document_path']}"
+                )
+                return 0
+
+            if arguments.handoff_command == "doctor":
+                issues = collect_handoff_doctor_issues(arguments.project_root)
+                report = format_doctor_report(issues)
+                if issues:
+                    print(report, end="", file=sys.stderr)
+                    return 2
+                print(report, end="")
+                return 0
+    except HandoffRejected as error:
+        print(f"错误: {error}", file=sys.stderr)
+        return 2
     except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1

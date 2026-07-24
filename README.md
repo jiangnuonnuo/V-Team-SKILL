@@ -1,6 +1,6 @@
 # V-Team
 
-Codex / Claude 多 Agent 项目协作技能。
+Codex / Claude 多 Agent 项目协作技能（调用名 `v-team`）。
 
 在真实仓库里，给多个 Agent 约定身份、白名单、唯一活动计划、审批门禁、风险分级测试和提交前范围检查，并让协作文档落在本地 `Plan/`，不进产品 Git 历史。
 
@@ -60,7 +60,7 @@ V-Team 把这些约定落成可执行流程：
 - 每个 Agent 独立身份、业务范围、模块映射、永久写入白名单
 - 任务粒度按完整功能或明确修复，不按文件机械拆分
 - 本地提交前只做一次 staged 范围检查
-- 跨 Agent 对接写在 `Plan/collaboration/`，完成即删
+- 跨 Agent 对接写在 `Plan/collaboration/`，用 `handoff list` 精确读取、`handoff create` 建档，完成即删
 - 零第三方 Python 依赖，Windows / macOS 可用
 
 ## 环境
@@ -95,6 +95,13 @@ python scripts/vteam.py agent \
 python scripts/vteam.py check-plan  --project-root /path/to/project --agent-id backend-1
 python scripts/vteam.py check-scope --project-root /path/to/project --agent-id backend-1
 python scripts/vteam.py cleanup     --project-root /path/to/project --agent-id backend-1
+
+# 对接：精确读取 / 一键创建 / 卫生检查
+python scripts/vteam.py handoff list   --project-root /path/to/project --agent-id frontend-1
+python scripts/vteam.py handoff create --project-root /path/to/project \
+  --from backend-1 --to frontend-1 --topic login-api \
+  --deliverable "登录接口" --acceptance "前端联调通过"
+python scripts/vteam.py handoff doctor --project-root /path/to/project
 ```
 
 ### Windows
