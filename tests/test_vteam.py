@@ -519,7 +519,87 @@ class ScopeCheckTests(VTeamTestCase):
         output = result.stdout + result.stderr
         self.assertEqual(2, result.returncode, output)
         self.assertIn("Plan/collaboration/active/H1-login-api.md", output)
-        self.assertIn("不得通过一次性授权", output)
+        self.assertIn("plan-git allow-stage", output)
+        self.assertIn("默认不得提交", output)
+
+    def test_plan_git_allow_stage_requires_confirm_flag(self) -> None:
+        """description: 输入无确认标志的 plan-git allow-stage；输出退出码 2 且不暂存 Plan。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.initialize_git_repository()
+        plan_note = self.project_root / "Plan" / "project.md"
+        plan_note.write_text("# note\n", encoding="utf-8")
+
+        result = self.run_cli(
+            "plan-git",
+            "allow-stage",
+            "--project-root",
+            str(self.project_root),
+        )
+        self.assertEqual(2, result.returncode, result.stdout + result.stderr)
+        self.assertIn("--i-confirm-user-explicitly-requested", result.stderr)
+        staged = self.run_git("diff", "--cached", "--name-only")
+        self.assertNotIn("Plan/", staged.stdout)
+
+    def test_plan_git_allow_stage_then_check_scope_passes_for_plan(self) -> None:
+        """description: 用户确认后 force-stage Plan；check-scope 在有授权时不把 Plan 当违规。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+        self.initialize_git_repository()
+        (self.project_root / "Plan" / "project.md").write_text(
+            "# project note for allow\n",
+            encoding="utf-8",
+        )
+
+        allow = self.run_cli(
+            "plan-git",
+            "allow-stage",
+            "--project-root",
+            str(self.project_root),
+            "--i-confirm-user-explicitly-requested",
+        )
+        self.assertEqual(0, allow.returncode, allow.stdout + allow.stderr)
+        staged = self.run_git("diff", "--cached", "--name-only")
+        self.assertIn("Plan/", staged.stdout)
+
+        scope = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+        self.assertEqual(0, scope.returncode, scope.stdout + scope.stderr)
+
+        revoke = self.run_cli(
+            "plan-git",
+            "revoke",
+            "--project-root",
+            str(self.project_root),
+        )
+        self.assertEqual(0, revoke.returncode, revoke.stdout + revoke.stderr)
+        # 撤销后若 Plan 仍在暂存区，check-scope 必须再次拒绝
+        scope_after = self.run_cli(
+            "check-scope",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+        self.assertEqual(2, scope_after.returncode, scope_after.stdout + scope_after.stderr)
+
+    def test_plan_git_status_reports_non_git(self) -> None:
+        """description: 输入非 Git 项目；plan-git status 标记 is_git=false。"""
+        self.assertEqual(0, self.initialize("codex").returncode)
+        result = self.run_cli(
+            "plan-git",
+            "status",
+            "--project-root",
+            str(self.project_root),
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertFalse(payload["is_git"])
+        self.assertFalse(payload["allow_active"])
 
     def test_backslashes_spaces_and_non_ascii_paths_are_normalized(self) -> None:
         """description: 输入反斜杠、空格和中文路径；输出为规范 Git 相对路径并可匹配目录规则。"""
@@ -1194,6 +1274,135 @@ class HandoffCommandTests(VTeamTestCase):
         self.assertIn("未发现问题", result.stdout)
 
 
+
+class ContextCommandTests(VTeamTestCase):
+    """description: 验证 context 冷启动索引输出身份、计划 stub 与 must_read。"""
+
+    def setUp(self) -> None:
+        """description: 初始化项目并注册 backend-1。"""
+        super().setUp()
+        self.assertEqual(0, self.initialize("codex").returncode)
+        self.assertEqual(0, self.register_agent("backend-1").returncode)
+
+    def test_context_reports_identity_and_empty_must_read(self) -> None:
+        """description: 输入已注册 Agent；输出 context 含白名单与空 must_read。"""
+        result = self.run_cli(
+            "context",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("CONTEXT agent_id=backend-1", result.stdout)
+        self.assertIn("write_whitelist:", result.stdout)
+        self.assertIn("backend/auth/", result.stdout)
+        self.assertIn("must_read_handoffs:", result.stdout)
+        self.assertIn("plan_stub:", result.stdout)
+        self.assertIn("skip_guidance:", result.stdout)
+
+    def test_context_json_includes_open_tasks_not_archive_body(self) -> None:
+        """description: 输入分区 PLAN；JSON open_tasks 仅当前态，档案计数单独给出。"""
+        plan_path = self.project_root / "Plan" / "agents" / "backend-1" / "PLAN.md"
+        plan_path.write_text(
+            "# backend-1 活动计划\n\n"
+            "- Agent ID: `backend-1`\n"
+            "- Status: `in-progress`\n"
+            "- Approval: `approved`\n\n"
+            "## 当前目标\n\n"
+            "实现登录。\n\n"
+            "## Review 与批准记录\n\n"
+            "- Reviewer: `r1`\n"
+            "- Scope: `PLAN.md`\n"
+            "- Review: `pass`\n"
+            "- Blockers: `none`\n"
+            "- Tests: `ok`\n"
+            "- Required changes: `none`\n\n"
+            "## 功能任务\n\n"
+            "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |\n"
+            "|---|---|---|---|---|\n"
+            "| T2 | 登录页 | pending | - | - |\n\n"
+            "## 当前阻塞与下一步\n\n"
+            "- 阻塞：无。\n"
+            "- 下一步：实现 T2。\n\n"
+            "## 已完成任务\n\n"
+            "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |\n"
+            "|---|---|---|---|---|\n"
+            "| T1 | 鉴权中间件 | completed | OK | abcdef1 |\n\n"
+            "## 放弃原因\n\n"
+            "- 无。\n",
+            encoding="utf-8",
+        )
+        result = self.run_cli(
+            "context",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "backend-1",
+            "--json",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual("in-progress", payload["plan"]["status"])
+        open_ids = [task["id"] for task in payload["plan"]["open_tasks"]]
+        self.assertEqual(["T2"], open_ids)
+        self.assertEqual(1, payload["plan"]["archived_task_count"])
+        self.assertIn("实现登录", payload["plan"]["current_goal"])
+
+    def test_context_lists_existing_must_read_handoff(self) -> None:
+        """description: 输入 open handoff 且文档存在；must_read 含该 doc。"""
+        self.assertEqual(
+            0,
+            self.run_cli(
+                "agent",
+                "--project-root",
+                str(self.project_root),
+                "--agent-id",
+                "frontend-1",
+                "--runtime",
+                "codex",
+                "--role",
+                "frontend",
+                "--responsibility",
+                "登录前端",
+                "--module",
+                "frontend/auth",
+                "--allow",
+                "frontend/auth/",
+            ).returncode,
+        )
+        create = self.run_cli(
+            "handoff",
+            "create",
+            "--project-root",
+            str(self.project_root),
+            "--from",
+            "backend-1",
+            "--to",
+            "frontend-1",
+            "--topic",
+            "login-api",
+            "--deliverable",
+            "登录接口",
+            "--acceptance",
+            "联调通过",
+        )
+        self.assertEqual(0, create.returncode, create.stderr)
+        result = self.run_cli(
+            "context",
+            "--project-root",
+            str(self.project_root),
+            "--agent-id",
+            "frontend-1",
+            "--json",
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        payload = json.loads(result.stdout)
+        docs = [item["doc"] for item in payload["must_read_handoffs"]]
+        self.assertTrue(docs, payload)
+        self.assertTrue(all(doc.startswith("Plan/collaboration/active/") for doc in docs))
+
+
 class SkillContractTests(VTeamTestCase):
 
     """description: 验证技能触发信息、强制工作流、资源清理和技能库索引保持一致。"""
@@ -1232,7 +1441,9 @@ class SkillContractTests(VTeamTestCase):
 
         self.assertIn("只在本地提交前统一检查一次", content)
         self.assertIn("git diff --cached --name-only", content)
-        self.assertIn("`Plan/` 路径不能通过一次性授权绕过", content)
+        self.assertIn("默认 `Plan/` 不能通过白名单外「一次性授权」绕过", content)
+        self.assertIn("plan-git allow-stage", content)
+        self.assertIn("--i-confirm-user-explicitly-requested", content)
         self.assertIn("可独立验收的完整功能或可独立验证的明确功能修复", content)
         self.assertNotIn("每次修改文件前", content)
         self.assertNotIn("Git Hook", content)
@@ -1312,14 +1523,17 @@ class SkillContractTests(VTeamTestCase):
             self.assertIn(fragment, content)
 
     def test_skill_documents_handoff_list_first_and_no_active_scan(self) -> None:
-        """description: 技能要求先 handoff list，禁止扫描 active，并维护协作依赖缓存。"""
+        """description: 技能要求 context/list 寻址，禁止扫描 active，并维护协作依赖缓存。"""
         content = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
         for fragment in [
+            "context",
             "handoff list",
             "禁止批量扫描 `Plan/collaboration/active/`",
             "协作依赖",
             "handoff create",
             "handoff doctor",
+            "当前态（会话必读）",
+            "档案（默认不读）",
         ]:
             self.assertIn(fragment, content)
 
@@ -1338,15 +1552,19 @@ class SkillContractTests(VTeamTestCase):
         self.assertIn("## 协作依赖", content)
         self.assertIn("Handoff ID", content)
         self.assertIn("handoff list", content)
+        self.assertIn("当前态（会话必读）", content)
+        self.assertIn("档案（默认不读）", content)
+        self.assertIn("## 已完成任务", content)
 
     def test_root_and_personal_templates_require_handoff_list(self) -> None:
-        """description: 根约束与个人模板要求 handoff list 并禁止扫 active。"""
+        """description: 根约束与个人模板要求 context/list 并禁止扫 active。"""
         for relative_path in [
             "references/root-agents-template.md",
             "references/root-claude-template.md",
             "references/personal-agent-template.md",
         ]:
             content = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("context", content, relative_path)
             self.assertIn("handoff list", content, relative_path)
             self.assertIn("Plan/collaboration/active/", content, relative_path)
 

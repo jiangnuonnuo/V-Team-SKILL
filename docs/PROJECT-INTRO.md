@@ -27,6 +27,7 @@ V-Team 是 Codex / Claude 的多 Agent **项目协作技能**，不是 CI 平台
 | 协作材料污染历史 | 进本地 `Plan/`，完成即清理 |
 | Codex / Claude 混用 | 同一套流程，双入口文件 |
 | Agent 代管 Git | **不做** push / merge / 分支管理 |
+| 个人全栈不知怎么拆 | **默认按角色**；单会话垂直链路可用切片/多前缀白名单；偶发越界一次性授权；真并行契约用 handoff（见 `SKILL.md`） |
 
 ## 系统结构
 
@@ -66,9 +67,9 @@ You / Team Lead
 交互版：[v-team-workflow.html](../assets/archify/v-team-workflow.html)
 
 1. 确认 ID  
-2. 读规则（根约束 + AGENT.md）  
-3. `handoff list`（仅读返回路径，禁止扫 `active/`）  
-4. 写唯一活动计划（协作依赖表缓存 list）  
+2. `context`（身份、白名单、计划 stub、must_read；减冷启动 token）  
+3. 读 `AGENT.md` + PLAN **当前态** + must_read 正文（默认不读档案 / 已完成任务；禁止扫 `active/`）  
+4. 写唯一活动计划（开放任务在当前态；完成后进档案；协作依赖缓存 list）  
 5. 独立 review  
 6. `check-plan`  
 7. 用户批准  
@@ -142,6 +143,7 @@ CLI：
 ```bash
 python scripts/vteam.py init
 python scripts/vteam.py agent
+python scripts/vteam.py context
 python scripts/vteam.py handoff list|create|doctor
 python scripts/vteam.py check-plan
 python scripts/vteam.py check-scope

@@ -36,8 +36,8 @@ V-Team 把这些约定落成可执行流程：
 ![V-Team Forced Delivery Loop](assets/archify/v-team-workflow.png)
 
 1. 确认 Agent ID（缺失则 onboarding）
-2. 读根约束 + 个人 `AGENT.md`
-3. 写唯一活动 `PLAN.md`
+2. `context` 冷启动索引 → 读 `AGENT.md` + PLAN **当前态** + must_read handoff（默认不读 PLAN 档案）
+3. 写/修订唯一活动 `PLAN.md`（开放任务在当前态；完成后移入档案）
 4. 独立 Agent 做计划 review
 5. `check-plan` 校验 review 记录
 6. 用户批准后才实现
@@ -51,7 +51,7 @@ V-Team 把这些约定落成可执行流程：
 - 身份不明 → 禁止实现
 - 计划未批准 → 禁止实现
 - 测试失败 → 禁止提交
-- staged 含 `Plan/` → 拒绝
+- staged 含 `Plan/` 且无用户明确 `plan-git` 授权 → 拒绝
 - 路径越界 → 当前提交一次性授权，不永久扩白名单
 
 ## 能力摘要
@@ -60,7 +60,10 @@ V-Team 把这些约定落成可执行流程：
 - 每个 Agent 独立身份、业务范围、模块映射、永久写入白名单
 - 任务粒度按完整功能或明确修复，不按文件机械拆分
 - 本地提交前只做一次 staged 范围检查
+- 根目录是 Git 时自动在 `.git/info/exclude` 忽略 `/Plan/`；非 Git 不动
+- 默认不提交 `Plan/`；仅用户明确要求后执行 `plan-git allow-stage --i-confirm-user-explicitly-requested`
 - 跨 Agent 对接写在 `Plan/collaboration/`，用 `handoff list` 精确读取、`handoff create` 建档，完成即删
+- **默认按角色/模块拆 Agent**；个人全栈一条链路且单会话交付时，可用切片身份或多前缀白名单，偶发越界走一次性授权（详见 `SKILL.md`「如何拆分 Agent」）
 - 零第三方 Python 依赖，Windows / macOS 可用
 
 ## 环境
@@ -90,6 +93,9 @@ python scripts/vteam.py agent \
   --allow backend/auth/ \
   --allow tests/auth/ \
   --read-doc Plan/collaboration/handoffs.md
+
+# 冷启动索引（身份 / 白名单 / 计划 stub / must_read handoff）
+python scripts/vteam.py context     --project-root /path/to/project --agent-id backend-1
 
 # 门禁
 python scripts/vteam.py check-plan  --project-root /path/to/project --agent-id backend-1

@@ -26,6 +26,8 @@ TOPIC_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 HANDOFF_ID_PATTERN = re.compile(r"^H(\d+)$", re.IGNORECASE)
 LOCAL_EXCLUDE_BEGIN = "# v-team local collaboration artifacts: begin"
 LOCAL_EXCLUDE_END = "# v-team local collaboration artifacts: end"
+PLAN_GIT_ALLOW_FILENAME = "v-team-plan-git-allow"
+PLAN_GIT_CONFIRM_FLAG = "--i-confirm-user-explicitly-requested"
 
 
 class HandoffRejected(Exception):
@@ -55,17 +57,42 @@ def write_text(path: Path, content: str, overwrite: bool = True) -> None:
         output_file.write(normalized_content)
 
 
-def ensure_local_plan_excluded(project_root: Path) -> None:
-    """description: 在已有 Git 仓库的本地排除规则中忽略 Plan 临时协作目录。
+def resolve_git_common_dir(project_root: Path) -> Path | None:
+    """description: 解析项目根对应的 Git 公共目录；非 Git 仓库返回 None。
 
     Args:
         project_root: 可能是 Git 仓库的项目根目录。
 
     Returns:
-        None。非 Git 目录保持无副作用，后续初始化 Git 后可再次运行本工具。
+        绝对路径形式的 Git 公共目录；`rev-parse` 失败时返回 None。
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-common-dir"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        return None
+    raw_path = result.stdout.strip()
+    if not raw_path:
+        return None
+    git_dir = Path(raw_path)
+    if not git_dir.is_absolute():
+        git_dir = (project_root / git_dir).resolve()
+    return git_dir
 
-    Raises:
-        OSError: Git 排除文件无法写入时抛出。
+
+def resolve_git_exclude_path(project_root: Path) -> Path | None:
+    """description: 解析本地 exclude 文件路径；非 Git 仓库返回 None。
+
+    Args:
+        project_root: 可能是 Git 仓库的项目根目录。
+
+    Returns:
+        exclude 文件绝对路径；非 Git 时返回 None。
     """
     result = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
@@ -76,14 +103,60 @@ def ensure_local_plan_excluded(project_root: Path) -> None:
         encoding="utf-8",
     )
     if result.returncode != 0:
-        return
-
+        return None
     raw_exclude_path = result.stdout.strip()
     if not raw_exclude_path:
-        return
+        return None
     exclude_path = Path(raw_exclude_path)
     if not exclude_path.is_absolute():
         exclude_path = project_root / exclude_path
+    return exclude_path
+
+
+def plan_git_allow_path(project_root: Path) -> Path | None:
+    """description: 返回用户明确授权「Plan 可进本地 Git」的标记文件路径。
+
+    Args:
+        project_root: 可能是 Git 仓库的项目根目录。
+
+    Returns:
+        `.git/.../v-team-plan-git-allow` 路径；非 Git 时返回 None。
+    """
+    git_dir = resolve_git_common_dir(project_root)
+    if git_dir is None:
+        return None
+    return git_dir / "info" / PLAN_GIT_ALLOW_FILENAME
+
+
+def is_plan_git_commit_allowed(project_root: Path) -> bool:
+    """description: 判断当前是否存在用户明确授权的 Plan 本地提交许可。
+
+    Args:
+        project_root: 项目根目录。
+
+    Returns:
+        标记文件存在则为 True；非 Git 或未授权为 False。
+    """
+    allow_path = plan_git_allow_path(project_root)
+    return allow_path is not None and allow_path.is_file()
+
+
+def ensure_local_plan_excluded(project_root: Path) -> None:
+    """description: 在已有 Git 仓库的本地排除规则中忽略 Plan 临时协作目录。
+
+    Args:
+        project_root: 可能是 Git 仓库的项目根目录。
+
+    Returns:
+        None。非 Git 目录保持无副作用，后续初始化 Git 后可再次运行本工具。
+        默认始终写入 `/Plan/` 排除；即使曾 force-add，日常 `git add .` 仍不会带上 Plan。
+
+    Raises:
+        OSError: Git 排除文件无法写入时抛出。
+    """
+    exclude_path = resolve_git_exclude_path(project_root)
+    if exclude_path is None:
+        return
 
     current_content = (
         exclude_path.read_text(encoding="utf-8")
@@ -102,6 +175,129 @@ def ensure_local_plan_excluded(project_root: Path) -> None:
         updated_content = f"{current_content}{separator}{managed_block}\n"
 
     write_text(exclude_path, updated_content)
+
+
+def stage_plan_for_local_git(project_root: Path, confirmed: bool) -> list[str]:
+    """description: 在用户明确确认后，把 Plan/ 强制暂存进本地 Git（不推远程）。
+
+    Args:
+        project_root: 已是 Git 仓库的项目根。
+        confirmed: 必须为 True，表示用户已明确要求把 Plan 纳入本地仓库。
+
+    Returns:
+        本次强制暂存后，暂存区中以 `Plan/` 开头的路径列表。
+
+    Raises:
+        ValueError: 未确认、非 Git 仓库，或 Plan 目录不存在。
+        RuntimeError: git add -f 失败。
+        OSError: 无法写入授权标记或排除规则。
+    """
+    if not confirmed:
+        raise ValueError(
+            "必须由用户明确要求，并传入 "
+            f"{PLAN_GIT_CONFIRM_FLAG}；Agent 不得自行授权将 Plan/ 写入 Git。"
+        )
+    if resolve_git_common_dir(project_root) is None:
+        raise ValueError("项目根不是 Git 仓库，无法将 Plan/ 加入本地仓库")
+
+    plan_root = project_root / "Plan"
+    if not plan_root.is_dir():
+        raise ValueError(f"不存在 Plan 目录: {plan_root}")
+
+    ensure_local_plan_excluded(project_root)
+    allow_path = plan_git_allow_path(project_root)
+    if allow_path is None:
+        raise ValueError("无法解析 Git 目录，无法写入 Plan 提交授权")
+    allow_path.parent.mkdir(parents=True, exist_ok=True)
+    write_text(
+        allow_path,
+        (
+            "v-team plan-git allow\n"
+            "user explicitly requested local Plan commit\n"
+            "revoke with: vteam.py plan-git revoke\n"
+        ),
+    )
+
+    add_result = subprocess.run(
+        ["git", "add", "-f", "--", "Plan"],
+        cwd=project_root,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if add_result.returncode != 0:
+        error_message = add_result.stderr.strip() or "git add -f Plan 失败"
+        raise RuntimeError(error_message)
+
+    staged = [
+        path
+        for path in collect_staged_git_changes(project_root)
+        if path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
+    ]
+    if not staged:
+        raise RuntimeError("已授权但暂存区未出现 Plan/ 路径；请检查 Plan 内容与 Git 状态")
+    return staged
+
+
+def revoke_plan_git_allow(project_root: Path) -> bool:
+    """description: 撤销 Plan 本地 Git 提交授权，并重新确保 /Plan/ 被本地排除。
+
+    Args:
+        project_root: 项目根目录。
+
+    Returns:
+        True 表示删除了授权标记；False 表示本就没有授权或非 Git。
+
+    Raises:
+        OSError: 删除标记或写回 exclude 失败。
+    """
+    allow_path = plan_git_allow_path(project_root)
+    removed = False
+    if allow_path is not None and allow_path.is_file():
+        allow_path.unlink()
+        removed = True
+    ensure_local_plan_excluded(project_root)
+    return removed
+
+
+def plan_git_status(project_root: Path) -> dict[str, object]:
+    """description: 汇总 Plan 相对本地 Git 的排除与授权状态。
+
+    Args:
+        project_root: 项目根目录。
+
+    Returns:
+        含 is_git、excluded、allow_active、staged_plan_paths 等字段的字典。
+    """
+    is_git = resolve_git_common_dir(project_root) is not None
+    excluded = False
+    if is_git:
+        exclude_path = resolve_git_exclude_path(project_root)
+        if exclude_path is not None and exclude_path.is_file():
+            content = exclude_path.read_text(encoding="utf-8")
+            excluded = (
+                LOCAL_EXCLUDE_BEGIN in content
+                and "/Plan/" in content
+                and LOCAL_EXCLUDE_END in content
+            )
+    staged_plan: list[str] = []
+    if is_git:
+        try:
+            staged_plan = [
+                path
+                for path in collect_staged_git_changes(project_root)
+                if path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
+            ]
+        except RuntimeError:
+            staged_plan = []
+    return {
+        "is_git": is_git,
+        "excluded": excluded,
+        "allow_active": is_plan_git_commit_allowed(project_root),
+        "staged_plan_paths": staged_plan,
+        "plan_exists": (project_root / "Plan").is_dir(),
+    }
 
 
 def render_template(template_name: str, values: dict[str, str]) -> str:
@@ -425,11 +621,17 @@ def check_scope(project_root: Path, agent_id: str) -> list[str]:
     ensure_local_plan_excluded(project_root)
     changed_paths = collect_staged_git_changes(project_root)
     whitelist = matching_agent["write_whitelist"]
-    return [
-        path
-        for path in changed_paths
-        if path.startswith(PLAN_PATH_PREFIX) or not path_is_allowed(path, whitelist)
-    ]
+    plan_commit_allowed = is_plan_git_commit_allowed(project_root)
+    violations: list[str] = []
+    for path in changed_paths:
+        is_plan_path = path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
+        if is_plan_path:
+            if not plan_commit_allowed:
+                violations.append(path)
+            continue
+        if not path_is_allowed(path, whitelist):
+            violations.append(path)
+    return violations
 
 
 def parse_markdown_row(line: str, expected_cells: int) -> list[str] | None:
@@ -536,24 +738,33 @@ def read_plan_state(plan_path: Path) -> dict[str, object]:
     if task_heading not in content:
         raise ValueError("PLAN.md 缺少固定功能任务表头")
 
-    task_section = extract_markdown_section(content, "功能任务")
-    tasks: list[dict[str, str]] = []
-    for line_number, line in enumerate(task_section.splitlines(), start=1):
-        try:
-            cells = parse_markdown_row(line, 5)
-        except ValueError as error:
-            raise ValueError(f"PLAN.md 功能任务表第 {line_number} 行错误: {error}") from error
-        if cells is None:
-            continue
-        tasks.append(
-            {
-                "id": cells[0],
-                "summary": cells[1],
-                "status": cells[2],
-                "test_result": cells[3],
-                "commit": cells[4],
-            }
-        )
+    def parse_task_section(section_name: str) -> list[dict[str, str]]:
+        section = extract_markdown_section(content, section_name)
+        parsed: list[dict[str, str]] = []
+        for line_number, line in enumerate(section.splitlines(), start=1):
+            try:
+                cells = parse_markdown_row(line, 5)
+            except ValueError as error:
+                raise ValueError(
+                    f"PLAN.md {section_name}表第 {line_number} 行错误: {error}"
+                ) from error
+            if cells is None:
+                continue
+            parsed.append(
+                {
+                    "id": cells[0],
+                    "summary": cells[1],
+                    "status": cells[2],
+                    "test_result": cells[3],
+                    "commit": cells[4],
+                }
+            )
+        return parsed
+
+    # 当前态「功能任务」+ 档案「已完成任务」合并，供 cleanup 证据校验。
+    open_tasks = parse_task_section("功能任务")
+    archived_tasks = parse_task_section("已完成任务")
+    tasks = open_tasks + archived_tasks
 
     reason_section = extract_markdown_section(content, "放弃原因")
     reason_lines = [
@@ -1570,6 +1781,232 @@ def upsert_agent(
     refresh_root_rules(project_root, team["runtimes"])
 
 
+def find_agent_record(project_root: Path, agent_id: str) -> dict[str, object]:
+    """description: 返回已注册 Agent 的 team.json 记录。"""
+    normalized = require_registered_agent(project_root, agent_id)
+    team = load_team(project_root)
+    for agent in team["agents"]:
+        if agent["id"] == normalized:
+            return agent
+    raise ValueError(f"team.json 中不存在 agent-id: {normalized}")
+
+
+def build_agent_context(project_root: Path, agent_id: str) -> dict[str, object]:
+    """description: 生成会话冷启动索引：身份、白名单、计划摘要与必读 handoff 路径。
+
+    Args:
+        project_root: 项目根目录。
+        agent_id: 已注册的 Agent ID。
+
+    Returns:
+        供 format_agent_context / JSON 输出的上下文字典。不替代 Read 合同正文。
+
+    Raises:
+        FileNotFoundError / ValueError: 身份或计划缺失、结构无效。
+    """
+    normalized = require_registered_agent(project_root, agent_id)
+    agent = find_agent_record(project_root, normalized)
+    plan_path = project_root / "Plan" / "agents" / normalized / "PLAN.md"
+    agent_path = project_root / "Plan" / "agents" / normalized / "AGENT.md"
+    project_md = project_root / "Plan" / "project.md"
+
+    plan_meta: dict[str, object] = {
+        "path": f"Plan/agents/{normalized}/PLAN.md",
+        "exists": plan_path.is_file(),
+        "status": None,
+        "approval": None,
+        "current_goal": None,
+        "blockers_next": None,
+        "open_tasks": [],
+        "archived_task_count": 0,
+        "guidance": (
+            "默认只读 PLAN「当前态（会话必读）」与开放「功能任务」；"
+            "不要整篇读取「档案（默认不读）」或反复阅读已完成任务，"
+            "除非回溯证据、放弃原因或用户明确要求。"
+        ),
+    }
+    if plan_path.is_file():
+        plan_state = read_plan_state(plan_path)
+        content = str(plan_state["content"])
+        plan_meta["status"] = plan_state["status"]
+        plan_meta["approval"] = plan_state["approval"]
+        plan_meta["current_goal"] = extract_markdown_section(content, "当前目标") or None
+        plan_meta["blockers_next"] = (
+            extract_markdown_section(content, "当前阻塞与下一步") or None
+        )
+        # 开放任务只取「功能任务」节，档案不计入 open_tasks
+        open_section = extract_markdown_section(content, "功能任务")
+        open_from_section: list[dict[str, str]] = []
+        for line in open_section.splitlines():
+            cells = parse_markdown_row(line, 5)
+            if cells is None:
+                continue
+            open_from_section.append(
+                {
+                    "id": cells[0],
+                    "summary": cells[1],
+                    "status": cells[2],
+                    "test_result": cells[3],
+                    "commit": cells[4],
+                }
+            )
+        plan_meta["open_tasks"] = open_from_section
+        archived_section = extract_markdown_section(content, "已完成任务")
+        archived_count = 0
+        for line in archived_section.splitlines():
+            if parse_markdown_row(line, 5) is not None:
+                archived_count += 1
+        plan_meta["archived_task_count"] = archived_count
+
+    handoffs = list_handoffs_for_agent(
+        project_root=project_root,
+        agent_id=normalized,
+        role="any",
+        statuses=set(ACTIVE_HANDOFF_STATUSES),
+    )
+    must_read: list[dict[str, str]] = []
+    for handoff in handoffs:
+        if handoff.get("doc_exists") != "true":
+            continue
+        must_read.append(
+            {
+                "id": handoff["id"],
+                "role": handoff["role"],
+                "status": handoff["status"],
+                "doc": handoff["document_path"],
+                "deliverable": handoff["deliverable"],
+                "acceptance": handoff["acceptance"],
+            }
+        )
+
+    root_files = []
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        if (project_root / name).is_file():
+            root_files.append(name)
+
+    return {
+        "agent_id": normalized,
+        "runtime": agent.get("runtime"),
+        "role": agent.get("role"),
+        "responsibility": agent.get("responsibility"),
+        "scope_statement": agent.get("scope_statement") or agent.get("responsibility"),
+        "modules": list(agent.get("modules") or []),
+        "write_whitelist": list(agent.get("write_whitelist") or []),
+        "collaboration_docs": list(agent.get("collaboration_docs") or []),
+        "paths": {
+            "agent_md": f"Plan/agents/{normalized}/AGENT.md",
+            "agent_md_exists": agent_path.is_file(),
+            "plan_md": f"Plan/agents/{normalized}/PLAN.md",
+            "plan_md_exists": plan_path.is_file(),
+            "project_md": "Plan/project.md",
+            "project_md_exists": project_md.is_file(),
+            "root_constraint_files": root_files,
+        },
+        "plan": plan_meta,
+        "must_read_handoffs": must_read,
+        "handoff_count": len(handoffs),
+        "skip_guidance": [
+            "不要批量扫描 Plan/collaboration/active/",
+            "不要默认整篇读取 PLAN 档案区与已完成任务表",
+            "context 是索引：合同正文与代码仍需按 must_read / 任务定向 Read",
+            "根约束若本会话已读且未改，可跳过重读 AGENTS.md/CLAUDE.md",
+        ],
+    }
+
+
+def format_agent_context(payload: dict[str, object]) -> str:
+    """description: 将 build_agent_context 结果格式化为 Agent 可直接消费的文本。"""
+    lines: list[str] = []
+    lines.append(f"CONTEXT agent_id={payload['agent_id']}")
+    lines.append(f"  runtime: {payload.get('runtime')}")
+    lines.append(f"  role: {payload.get('role')}")
+    lines.append(f"  responsibility: {payload.get('responsibility')}")
+    lines.append(f"  scope: {payload.get('scope_statement')}")
+    modules = payload.get("modules") or []
+    lines.append("  modules:")
+    if modules:
+        for item in modules:
+            lines.append(f"    - {item}")
+    else:
+        lines.append("    - (none)")
+    lines.append("  write_whitelist:")
+    whitelist = payload.get("write_whitelist") or []
+    if whitelist:
+        for item in whitelist:
+            lines.append(f"    - {item}")
+    else:
+        lines.append("    - (none)")
+
+    paths = payload.get("paths") or {}
+    lines.append("paths:")
+    lines.append(
+        f"  agent_md: {paths.get('agent_md')} exists={paths.get('agent_md_exists')}"
+    )
+    lines.append(
+        f"  plan_md: {paths.get('plan_md')} exists={paths.get('plan_md_exists')}"
+    )
+    lines.append(
+        f"  project_md: {paths.get('project_md')} exists={paths.get('project_md_exists')}"
+    )
+    roots = paths.get("root_constraint_files") or []
+    lines.append(
+        "  root_constraints: " + (", ".join(roots) if roots else "(none)")
+    )
+
+    plan = payload.get("plan") or {}
+    lines.append("plan_stub:")
+    lines.append(f"  status: {plan.get('status')}")
+    lines.append(f"  approval: {plan.get('approval')}")
+    lines.append(f"  archived_task_count: {plan.get('archived_task_count')}")
+    goal = plan.get("current_goal")
+    if goal:
+        lines.append("  current_goal:")
+        for goal_line in str(goal).splitlines():
+            lines.append(f"    {goal_line}")
+    else:
+        lines.append("  current_goal: (empty)")
+    blockers = plan.get("blockers_next")
+    if blockers:
+        lines.append("  blockers_next:")
+        for blocker_line in str(blockers).splitlines():
+            lines.append(f"    {blocker_line}")
+    open_tasks = plan.get("open_tasks") or []
+    lines.append("  open_tasks:")
+    if open_tasks:
+        for task in open_tasks:
+            lines.append(
+                f"    - {task.get('id')}: {task.get('summary')} "
+                f"[{task.get('status')}]"
+            )
+    else:
+        lines.append("    - (none)")
+    if plan.get("guidance"):
+        lines.append(f"  guidance: {plan.get('guidance')}")
+
+    must_read = payload.get("must_read_handoffs") or []
+    lines.append(f"must_read_handoffs: count={len(must_read)}")
+    if must_read:
+        for handoff in must_read:
+            lines.append(
+                f"  - {handoff.get('id')} role={handoff.get('role')} "
+                f"status={handoff.get('status')}"
+            )
+            lines.append(f"    doc: {handoff.get('doc')}")
+            lines.append(f"    deliverable: {handoff.get('deliverable')}")
+            lines.append(f"    acceptance: {handoff.get('acceptance')}")
+    else:
+        lines.append("  - (none; list empty or docs missing)")
+
+    lines.append("skip_guidance:")
+    for item in payload.get("skip_guidance") or []:
+        lines.append(f"  - {item}")
+    lines.append(
+        "next: Read AGENT.md（若未读）→ 仅 Read must_read 对接正文 → "
+        "按需打开 PLAN 当前态；默认不读档案。"
+    )
+    return "\n".join(lines) + "\n"
+
+
 def build_parser() -> argparse.ArgumentParser:
     """description: 构建 V-Team 命令行参数解析器。
 
@@ -1577,7 +2014,7 @@ def build_parser() -> argparse.ArgumentParser:
         无。
 
     Returns:
-        包含 init、agent、check-plan、check-scope、cleanup 与 handoff 子命令的 ArgumentParser。
+        包含 init、agent、context、check-plan、check-scope、cleanup、plan-git 与 handoff 子命令的 ArgumentParser。
 
     Raises:
         无。
@@ -1613,6 +2050,19 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument("--module", action="append", required=True)
     agent_parser.add_argument("--allow", action="append", required=True)
     agent_parser.add_argument("--read-doc", action="append", default=[])
+
+    context_parser = subparsers.add_parser(
+        "context",
+        help="会话冷启动索引：身份、白名单、计划摘要与必读 handoff",
+    )
+    context_parser.add_argument("--project-root", required=True, type=Path)
+    context_parser.add_argument("--agent-id", required=True)
+    context_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="以 JSON 输出完整上下文字典",
+    )
 
     plan_parser = subparsers.add_parser(
         "check-plan",
@@ -1701,6 +2151,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     handoff_doctor.add_argument("--project-root", required=True, type=Path)
 
+    plan_git_parser = subparsers.add_parser(
+        "plan-git",
+        help="Plan/ 默认排除；仅用户明确要求时允许强制纳入本地 Git",
+    )
+    plan_git_sub = plan_git_parser.add_subparsers(
+        dest="plan_git_command",
+        required=True,
+    )
+    plan_git_status_parser = plan_git_sub.add_parser(
+        "status",
+        help="查看 Plan 本地排除与用户授权状态",
+    )
+    plan_git_status_parser.add_argument("--project-root", required=True, type=Path)
+    plan_git_allow_parser = plan_git_sub.add_parser(
+        "allow-stage",
+        help="用户明确要求后：写授权标记并用 git add -f 暂存 Plan/",
+    )
+    plan_git_allow_parser.add_argument("--project-root", required=True, type=Path)
+    plan_git_allow_parser.add_argument(
+        PLAN_GIT_CONFIRM_FLAG,
+        action="store_true",
+        dest="user_confirmed",
+        help="必须由用户明确要求纳入 Plan 后才可传入",
+    )
+    plan_git_revoke_parser = plan_git_sub.add_parser(
+        "revoke",
+        help="撤销 Plan 本地提交授权并恢复 /Plan/ 排除",
+    )
+    plan_git_revoke_parser.add_argument("--project-root", required=True, type=Path)
+
     return parser
 
 
@@ -1711,7 +2191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         argv: 不含程序名的命令行参数；为空时读取 sys.argv。
 
     Returns:
-        0 表示成功，1 表示已知配置或文件错误，2 表示范围越界或 handoff 业务拒绝/doctor 发现问题。
+        0 表示成功，1 表示已知配置或文件错误，2 表示范围越界、未确认的 plan-git、或 handoff 业务拒绝/doctor 发现问题。
 
     Raises:
         SystemExit: argparse 在参数格式错误时终止并返回标准退出码。
@@ -1738,6 +2218,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 scope_statement=arguments.scope,
             )
             print(f"Agent 已更新: {arguments.agent_id}")
+            return 0
+
+        if arguments.command == "context":
+            payload = build_agent_context(
+                project_root=arguments.project_root,
+                agent_id=arguments.agent_id,
+            )
+            if arguments.as_json:
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+            else:
+                print(format_agent_context(payload), end="")
             return 0
 
         if arguments.command == "check-plan":
@@ -1768,7 +2259,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"- {violation}", file=sys.stderr)
             if plan_violations:
                 print(
-                    "Plan/ 是本地临时协作区，必须从暂存区移除；不得通过一次性授权提交。",
+                    "Plan/ 默认不得提交。仅当用户明确要求后，运行 "
+                    f"plan-git allow-stage {PLAN_GIT_CONFIRM_FLAG} "
+                    "强制暂存；提交完成后建议 plan-git revoke。",
                     file=sys.stderr,
                 )
             if ordinary_violations:
@@ -1800,6 +2293,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
             return 0
+
+        if arguments.command == "plan-git":
+            if arguments.plan_git_command == "status":
+                status = plan_git_status(arguments.project_root)
+                print(json.dumps(status, ensure_ascii=False, indent=2))
+                return 0
+            if arguments.plan_git_command == "allow-stage":
+                if not arguments.user_confirmed:
+                    print(
+                        "错误: 缺少用户明确确认标志 "
+                        f"{PLAN_GIT_CONFIRM_FLAG}；"
+                        "Agent 不得自行把 Plan/ 写入 Git。",
+                        file=sys.stderr,
+                    )
+                    return 2
+                staged = stage_plan_for_local_git(
+                    arguments.project_root,
+                    confirmed=True,
+                )
+                print(
+                    "已按用户明确要求授权并强制暂存 Plan/ "
+                    f"({len(staged)} 个路径)。本地提交后建议运行 plan-git revoke。"
+                )
+                for path in staged:
+                    print(f"- {path}")
+                return 0
+            if arguments.plan_git_command == "revoke":
+                removed = revoke_plan_git_allow(arguments.project_root)
+                if removed:
+                    print("已撤销 Plan 本地提交授权，并恢复 /Plan/ 本地排除。")
+                else:
+                    print("无活动授权；已确保 /Plan/ 本地排除（若为 Git 仓库）。")
+                return 0
 
         if arguments.command == "handoff":
             if arguments.handoff_command == "list":
