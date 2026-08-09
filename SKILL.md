@@ -1,266 +1,135 @@
 ---
 name: v-team
-description: Use when a Codex or Claude project needs multi-agent collaboration, distinct roles, module ownership boundaries, temporary Plan-based handoffs, or recoverable active planning across independent agent sessions.
+description: 个人功能开发的角色化交付技能。仅在用户明确调用 `$v-team` 时使用；根据任务复杂度选择需求、架构、后端、前端、QA 等最小角色链路，先评估价值与方案，再在用户确认后开发，并通过可发现的接口契约完成前后端对接。普通问答、简单重复改动和未明确调用时不要使用。
 ---
 
 # V-Team
 
-## 概述
+V-Team 是个人使用的功能交付工作流，不是多 Agent 编排器。它按“功能 + 职能”临时确定角色，例如 `backend-sandbox-api`、`frontend-sandbox-console`、`architect-agent-runtime`。一个角色对一个功能结果负责；角色可以由同一 Agent 依次承担，也可以由不同 Agent 承担。
 
-在一个项目目录内组织 Codex、Claude 或混合 Agent 团队。使用 `Plan/team.json` 保存身份和永久白名单事实，使用项目根约束与个人 `AGENT.md` 强制行为边界，使用单份活动 `PLAN.md` 保持审批、测试、本地提交和恢复进度可追踪。`Plan/` 默认是本地临时协作区，不进入产品 Git 提交；仅用户明确要求后可通过 `plan-git allow-stage` 纳入本地仓库。
+## 核心原则
 
-核心原则：先确认身份和计划，再实现；默认遵守模块归属，同时允许跨模块；只在本地提交前检查一次暂存范围；临时对接文档只写入 `Plan/`，关闭后删除。
+1. 用户没有明确调用 `$v-team` 时，不触发本技能。
+2. 先判断任务路线，再决定是否分析、设计或编码。
+3. 标准功能先完成价值、需求与技术方案沟通；用户确认前不修改业务代码。
+4. 不为问题、分析、方案草稿、日常测试或普通状态新建文件。
+5. 实际交付物优先写入产品代码、测试、OpenAPI、Schema、共享类型和现有架构文档。
+6. 只读取当前角色、当前能力和当前契约所需的最小上下文。
+7. 不强制路径白名单、模块所有权、独立 AGENT/PLAN、handoff 文档、提交或分支治理。
 
-## 项目结构
+## 第一步：选择任务路线
 
-初始化后使用固定结构：
+读取 [role-router.md](references/role-router.md)，把任务分为以下一种路线：
 
-```text
-<project-root>/
-  AGENTS.md                         # 存在 Codex Agent 时生成
-  CLAUDE.md                         # 存在 Claude Agent 时生成
-  Plan/
-    project.md
-    team.json
-    agents/
-      <agent-id>/
-        AGENT.md
-        PLAN.md
-    collaboration/
-      handoffs.md
-      active/
-        <handoff-id>-<topic>.md
-```
+- **问答/分析**：只回答和分析；不改代码，不创建 `.vteam`，不留档。
+- **快速改动**：需求明确、重复性强、低风险且不改变公共契约、数据、安全或架构；直接实现并做最小充分验证，不创建 V-Team 状态。
+- **标准功能**：有新用户能力或行为变化；走价值/需求 → 技术方案/架构 → 用户确认 → 角色开发 → 验证闭环。
+- **重大改造**：跨模块、难回滚、公共协议/数据迁移/安全边界/核心架构变化，或需要跨会话恢复；在标准功能路线之上使用紧凑状态和里程碑。
 
-不创建项目版本目录。每个 Agent 只维护 `Plan/agents/<agent-id>/PLAN.md` 这一份活动计划。
+无法确定时按风险更高的一档处理。只要涉及公共 API、Schema、数据迁移、权限、安全、兼容性或架构边界，就不能走快速改动。
 
-## 强制工作流
+## 第二步：建立功能身份
 
-### 1. 初始化项目
+为本次功能使用稳定的 `capability_id`，推荐小写短横线，例如 `sandbox-runtime`。按实际结果选择最少角色，并用 `<职能>-<功能范围>` 命名角色：
 
-根据实际运行端选择命令：
+- `requirement-*`：需求、价值、范围与验收
+- `architect-*`：边界、技术选型与落地架构
+- `backend-*`：业务规则、接口、数据与服务实现
+- `frontend-*`：用户流程、UI、页面、接口集成与浏览器验证
+- `qa-*`：风险、端到端验收与缺陷复测
 
-```bash
-python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime codex
-python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime claude
-python <skill-root>/scripts/vteam.py init --project-root <project-root> --runtime codex --runtime claude
-```
+不要因为存在角色就全部启用。纯后端能力不必启用前端；纯 UI 改动不必启用架构师；高风险全栈功能通常需要完整链路。
 
-`codex` 生成 `AGENTS.md`，`claude` 生成 `CLAUDE.md`，混合团队同时生成两个入口。重复初始化只补充运行端和缺失的活动文档，不覆盖已有项目进度；若项目已是 Git 仓库，会在本地 `.git/info/exclude` 忽略 `/Plan/`，不修改既有 Git 历史。默认 `Plan/` 永不进入产品提交；仅当**用户明确要求**把协作材料纳入**本地**仓库时，才允许运行专用命令 `plan-git allow-stage --i-confirm-user-explicitly-requested`（内部 `git add -f Plan` + 本地授权标记）。Agent 不得自行调用该命令；提交完成后应 `plan-git revoke`。非 Git 根目录不写排除规则。
+## 第三步：执行角色链路
 
-### 2. 注册 Agent
+根据选中的角色只读取对应参考：
 
-用户可以直接以自然语言指定 Agent ID、角色和业务/项目范围。Agent 读取当前项目结构后，自行映射足以完成工作的模块、测试、配置与协作文档；映射唯一时直接注册，范围无法映射或与其他 Agent 明显争夺同一业务模块时才询问一个最小问题。初始化项目会生成项目内 `Plan/onboarding.md`，供后续独立会话使用。
+- 需求：[role-requirement.md](references/role-requirement.md)
+- 架构：[role-architect.md](references/role-architect.md)
+- 后端：[role-backend.md](references/role-backend.md)
+- 前端：[role-frontend.md](references/role-frontend.md)
+- QA：[role-qa.md](references/role-qa.md)
 
-注册时使用 Agent ID、运行端、角色、职责、用户范围、至少一个负责模块、永久写入白名单和需要读取的协作文档：
+角色链路不是一份通用 PLAN：
 
-```bash
-python <skill-root>/scripts/vteam.py agent \
-  --project-root <project-root> \
-  --agent-id backend-1 \
-  --runtime codex \
-  --role backend \
-  --responsibility "用户与权限后端" \
-  --scope "用户与权限后端全部代码" \
-  --module backend/auth \
-  --allow backend/auth/ \
-  --allow tests/auth/ \
-  --read-doc Plan/collaboration/handoffs.md
-```
+- 需求角色先回答“为什么做、做什么、不做什么、怎样算完成”。
+- 架构角色把确认后的需求转成可落地边界、组件、数据流、契约、迁移与回滚方案。
+- 后端角色先发布可消费的契约，再实现并验证服务。
+- 前端角色先完成用户流与 UI 状态设计，可基于 draft 契约做 mock；契约 ready 后再真实联调。
+- QA 角色围绕验收标准和风险做模块与跨角色闭环。
 
-同一角色可以注册多个不同 ID。`Plan/team.json` 保存身份、用户范围、运行端和白名单事实；重新生成个人约束时以它为准。`--scope` 未提供时兼容旧用法并使用 `--responsibility`。
+## 标准功能的沟通门禁
 
-### 3. 确认身份并读取最小上下文
+在修改业务代码前，在对话中给用户一份紧凑结论，至少包含：
 
-严格执行以下顺序（优先用 `context` 减冷启动 token，**不替代**合同正文与代码的定向 Read）：
+1. 用户问题、价值与使用频率；现有能力能否复用；不开发是否更合理。
+2. 目标、范围、非目标、关键场景和可验证验收条件。
+3. 可行性、约束、风险及至少一个替代方案。
+4. 推荐技术方案：边界、关键组件、数据流、契约、兼容/迁移/回滚。
+5. 建议启用的角色链路和实现顺序。
 
-1. 从用户指令或当前任务上下文确认 `agent-id`；身份不明确时按 `Plan/onboarding.md` 快速入职，入职完成前禁止实现代码。
-2. 运行冷启动索引（推荐，替代「整篇 PLAN + 再单独 list」的固定开场）：
+明确请求用户确认该方案。确认前可以只读检查代码、验证可行性或做非业务性的探索，不得开始功能实现。若用户已在同一上下文中明确批准了完整方案，无需重复确认。
 
-```bash
-python <skill-root>/scripts/vteam.py context --project-root <project-root> --agent-id <agent-id>
-```
+快速改动不走此门禁；重大改造不得跳过。
 
-`context` 输出身份、永久白名单、计划 stub（Status/Approval/当前目标/开放任务/阻塞下一步）、`must_read_handoffs` 路径与 skip 指引。需要机器解析时加 `--json`。`context` **不是**计划正文或 handoff 合同的替代品。
+## 前后端契约对接
 
-3. 若本会话尚未读过且根约束可能影响行为：读取项目根 `AGENTS.md` 或 `CLAUDE.md`。同一会话内文件未变可跳过重读。
-4. 强制读取 `Plan/agents/<agent-id>/AGENT.md`（`context` 已标 `exists`）；文件缺失时停止并要求先注册身份。
-5. **不要**默认整篇读取 `PLAN.md`。只打开「当前态（会话必读）」：当前目标、范围、验收与风险、Review/批准、**开放**功能任务、阻塞与下一步、协作依赖、一次性授权。默认**不读**「档案（默认不读）」与「已完成任务」表，除非回溯提交/测试证据、填写放弃原因、整体收尾或用户明确要求。需要项目背景时再读 `Plan/project.md`。
-6. 对 `context` / 等价 `handoff list` 给出的 `must_read` 且文档存在的路径，**必须** Read 对接正文。禁止批量扫描 `Plan/collaboration/active/`，禁止用 ls/glob 枚举对接正文。将结果写入本 `PLAN.md`「协作依赖」表（会话缓存；真源仍是 `Plan/collaboration/handoffs.md`）。无 must_read 则跳过。
-7. 代码、根目录、`doc/` 和 `docs/` 的可靠资料仍可读取。默认忽略其他 Agent 历史，以及状态为 `completed` 或 `abandoned` 的计划。日常寻址以 `context` / `handoff list` 为准。
+涉及跨角色接口时读取 [contract-policy.md](references/contract-policy.md)。核心约定：
 
-### 4. 编写单份计划并等待审批
+1. 后端把真实契约保存在产品仓库既有来源中，如 OpenAPI、GraphQL Schema、protobuf、JSON Schema、共享类型或契约测试。
+2. V-Team 只保存契约索引，不复制接口正文。
+3. 契约索引必须包含稳定 `id`、`capability`、`provider`、`consumers`、`source`、`source_ref`、`status`、`version`、`breaking`，以及可选 `mock`、`verification`。
+4. 前端按 `capability + consumer role` 发现契约：零个则阻塞并报告；一个则直接使用；多个则列出供选择，禁止猜测。
+5. `draft` 只允许 UI/mock 开发；`ready` 或 `verified` 才允许真实集成；`blocked` 明确阻塞；`deprecated` 默认不参与发现。
 
-直接覆盖或修订自己的 `PLAN.md` 当前内容，不为新对话、新需求或普通修复复制新文件。计划分两区：
+如果项目已有 API Catalog 或 Schema Registry，优先使用它。否则按需调用 `scripts/vteam.py`，仅维护一个 `.vteam/state.json`。
 
-- **当前态（会话必读）**：当前目标、用户需求、范围与非目标、验收与风险、Review/批准、**仅未完成**的功能任务、阻塞与下一步、协作依赖、一次性授权。
-- **档案（默认不读）**：已完成任务表（含测试结果与本地提交哈希）、历史需求/范围与 Review 纪要、放弃原因、整体完成结论。
+## 状态与留档
 
-任务完成后把该行从「功能任务」移到「已完成任务」，避免冷启动反复读入已交付证据。`check-plan` / `cleanup` 仍从两表合并解析任务证据。
+默认不创建状态文件。仅在以下有意义事件发生时写入：
 
-计划必须记录：
+- 后端发布或更新跨角色契约索引；
+- 功能需要跨会话恢复，写入一条当前恢复状态；
+- 模块完成，更新该能力的当前完成事实并清除恢复状态；
+- 用户明确要求，或满足重大里程碑条件。
 
-- 当前目标、用户需求、范围、非目标和预计修改路径（当前态）。
-- 验收标准、风险、review 记录和协作依赖（当前态）。
-- 用户批准状态和批准记录（当前态）。
-- 开放功能任务；完成后进档案并保留测试等级、命令与结果、证据有效范围、本地提交哈希（当前态 + 档案）。
-- 当前阻塞、下一步；收尾时的整体完成结论与放弃原因（档案侧）。
+状态规则见 [milestone-policy.md](references/milestone-policy.md)：
 
-每个任务项只能是可独立验收的完整功能或可独立验证的明确功能修复，并适合形成一次语义完整的本地提交。功能可用并通过相应验证后即可作为一次 `feat`、`fix` 或任务提交；不要把创建文件、新增方法或改一行配置单独拆成任务，除非它本身就是完整交付。
+- 每个 capability 最多一条 `active`，更新时覆盖，不追加过程日志。
+- 完成或放弃后删除 `active`。
+- 普通模块完成不生成总结文档或 ADR。
+- 重大里程碑优先引用 Git commit/tag/release、现有架构文档或 ADR。
+- 不读取与当前 capability 无关的历史正文。
 
-Review 审查当前 `PLAN.md` 的需求与非目标、模块归属、验收标准、改动范围与风险、测试等级和命令、结果证据以及失败/例外处理。记录 `Reviewer`、`Scope`、`Review`、`Blockers`、`Tests` 与 `Required changes`，并填写测试等级、命令与结果、证据有效范围；`Review` 为 `pass`、所有必填项已填写且 `Blockers`、`Required changes` 均为 `none` 或 `无` 后运行：
+脚本仅供 Agent 执行确定性操作，用户不需要记命令：
 
 ```bash
-python <skill-root>/scripts/vteam.py check-plan --project-root <project-root> --agent-id <agent-id>
+python scripts/vteam.py context --project-root <root> --role-id frontend-sandbox-console --capability sandbox-runtime --json
+python scripts/vteam.py contract discover --project-root <root> --capability sandbox-runtime --consumer frontend-sandbox-console --json
 ```
 
-通过后才可设为 `waiting-approval`。用户批准前禁止实现代码。Reviewer 默认审阅当前 diff 和已有测试结果，不重复执行测试；仅在证据缺失或过期、结果与验收标准冲突、属于相关完整回归或全仓回归，或发现新的高风险影响时补充验证。跨模块、接口、安全或数据迁移任务在提交前增加一次代码 review，阻塞项未清零不得提交。
+需要写状态时再执行 `contract publish|verify|deprecate`、`resume set|clear`、`module complete` 或 `milestone record`。先运行 `--help` 获取字段，不把 CLI 当作用户流程。
 
-### 5. 实现、测试和本地提交
+## 实现与验证
 
-每个功能任务按以下顺序执行：
+用户批准标准/重大方案后：
 
-1. 按风险选择测试等级。定向验证适用于单模块、低风险功能或明确修复；相关完整回归适用于跨模块、公共接口、安全或数据迁移，覆盖受影响模块、直接依赖模块、接口契约/集成测试及必要构建、类型或静态检查；全仓回归只适用于发布、全局基础设施或全局配置变更。一个任务存在多项条件时，以最高适用等级为准。
-2. 实现计划内的完整功能或明确修复，并运行该等级足以证明功能正确的测试；定向验证不扩展到无关复杂场景。
-3. 同一代码、依赖和运行配置未变化时，成功测试结果可复用为任务完成和提交前验证证据；只有受测代码、相关依赖、配置或测试环境变化后才重新运行对应验证。外部真实接口验证必须限频；失败后先记录和分析原因，不进行无条件自动重试。任何再次真实调用都必须在计划中记录触发条件、次数上限和预期证据；无法判断时询问用户。
-4. 测试失败时停止提交，记录失败原因，任务保持未完成。
-5. 测试通过后暂存当前完整功能或明确修复需要提交的代码、测试和配置；默认 `Plan/` 中的计划、身份和对接文件均不得暂存。
-6. 只在本地提交前统一检查一次：
+1. 读取当前角色参考、相关代码和已发现契约。
+2. 实现当前角色负责的完整功能结果，不按文件机械拆角色。
+3. 按风险执行必要的单元、契约、集成、浏览器或端到端测试。
+4. 检查加载、空、错误、权限、网络、重复提交、兼容和回滚等相关边界。
+5. 结果未达到验收条件时继续修复，不用文档更新代替可运行结果。
+6. 完成后向用户报告实际变更、验证结果、风险和仍需对接项。
 
-```bash
-python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> --agent-id <agent-id>
-```
+V-Team 不自行要求本地提交、push、merge 或 PR；是否执行 Git 操作以用户请求和项目规则为准。
 
-该命令内部只调用一次 `git diff --cached --name-only`，只检查准备提交的内容。退出码 `0` 表示范围通过，`2` 表示存在越界路径或未授权的 `Plan/` 路径，`1` 表示配置或 Git 错误。
+## 完成定义
 
-范围通过后使用中文完成该完整功能或明确修复的一次本地 Git 提交；提交按可用功能或修复划分，而不是按文件集合或文件类型划分。默认 `Plan/` 不能通过白名单外「一次性授权」绕过。仅当用户**明确要求**上传/纳入本地仓库时，使用：
+一个模块只有同时满足以下条件才算完成：
 
-```bash
-python <skill-root>/scripts/vteam.py plan-git allow-stage \
-  --project-root <project-root> \
-  --i-confirm-user-explicitly-requested
-python <skill-root>/scripts/vteam.py check-scope --project-root <project-root> --agent-id <agent-id>
-# 本地 commit 成功后
-python <skill-root>/scripts/vteam.py plan-git revoke --project-root <project-root>
-```
-
-`plan-git status` 可查看排除与授权状态。禁止自行推送远程，禁止自行合并。本技能不创建、切换、命名或管理 Git 分支。
-
-提交成功后立即在 `PLAN.md` 把任务标记为完成，记录测试命令与结果和本地提交哈希。提交失败时不得填写哈希或标记完成。
-
-## 边界与跨模块协作
-
-白名单表示“无需再次询问即可提交”的默认边界，不限制读取和理解其他模块。Agent 优先处理自己的模块，但允许跨模块修改，前提是能确认调用关系、影响范围和测试方式。
-
-发现非 `Plan/` 的白名单外路径时：
-
-1. 暂停当前本地提交。
-2. 向用户列出越界路径、修改原因、影响模块和建议提交说明。
-3. 询问用户是否允许当前提交。
-4. 用户同意后，在当前 `PLAN.md` 记录一次性授权，再提交本次变更。
-5. 一次性授权只对当前提交有效，不得修改 `Plan/team.json` 扩大永久白名单。
-6. 用户拒绝时，不得提交越界路径；拆分、撤销或交给更合适的 Agent。
-
-简单的一次性跨模块修改只走上述授权流程，不强制创建 handoff。
-
-## 如何拆分 Agent（角色默认，切片可选）
-
-**默认仍按角色/模块注册**（如 `backend-1`、`frontend-1`）：永久白名单对准技术边界，职责清晰，适合并行和书面对接。不要为了「少建 Agent」而取消角色编制。
-
-个人全栈或一人编排多个会话时，**交付单元（一条用户功能）** 常跨多层，与 **所有权单元（角色目录）** 不是同一刀。按下表选择，避免每个小改动都外交，也避免假分离：
-
-| 场景 | 怎么拆 | 对接 |
-|------|--------|------|
-| 前后端/多角色要**并行**，接口会变、需要稳定契约 | **按角色**注册；白名单各管一层 | 接收方必须消费契约时用 `handoff create`；接收会话启动先 `handoff list` |
-| 功能是**一条垂直链路**，且同一时期 mainly **一个会话**做完（如小登录全栈） | 可注册**切片 Agent**（或给角色 Agent 配置**多前缀** `--allow`，覆盖该链路相关目录与测试） | 无第二消费方则**不建** handoff；说明写在自己的 `PLAN.md` |
-| 已有角色 Agent，只**偶发**改对面一层 | 保持原身份 | **一次性授权**，不扩 `team.json`，不强制 handoff |
-| 两角色已并行，中途发现边界画错 | 用户确认后调整 `--allow` / 增补模块，或把剩余工作交给更合适的 `agent-id` | 已有 open handoff 则修订正文，不复制 topic |
-
-约束（三条不变）：
-
-1. **身份仍要唯一 `agent-id`**；切片也是正式注册，不是匿名「什么都改」。
-2. **白名单仍是提交边界**；切片只是把边界画成「本功能相关的多棵目录」，不是关闭 `check-scope`。
-3. **有另一已注册 Agent 必须靠契约才能交付时，必须 handoff**；仅为自己备忘不建对接。
-
-注册切片示例（路径按项目替换）：
-
-```bash
-python <skill-root>/scripts/vteam.py agent \
-  --project-root <project-root> \
-  --agent-id auth-slice \
-  --runtime claude \
-  --role fullstack \
-  --responsibility "登录注册垂直切片" \
-  --scope "登录相关前后端与测试" \
-  --module backend/auth \
-  --module web/login \
-  --allow backend/auth/ \
-  --allow web/login/ \
-  --allow tests/auth/ \
-  --read-doc Plan/collaboration/handoffs.md
-```
-
-一人操作多个 Agent 时：同时尽量只让一个身份处于「可本地提交」；冲突与集成以手中的 handoff 契约和用户裁决为准。本技能仍不管理 Git 分支。
-
-## 临时协作文档
-
-默认不建对接。只有另一已注册 Agent 必须消费本契约/接口才能完成用户可感知交付时，才建立临时对接：
-
-```bash
-python <skill-root>/scripts/vteam.py handoff create \
-  --project-root <project-root> \
-  --from <proposer-id> --to <receiver-id> \
-  --topic <slug> --deliverable "..." --acceptance "..."
-```
-
-| 文档 / 命令 | 当前职责 |
-|---|---|
-| `handoff list` | 接收/提出方精确列出应读路径；启动协作时必用 |
-| `handoff create` | 一键登记 + 生成 `active/<id>-<topic>.md`；禁止手搓未登记文件 |
-| `handoff doctor` | 报告孤儿 active、缺失路径、无效 agent-id；不默认删除 |
-| `Plan/collaboration/handoffs.md` | 对接真源表；优先索引 |
-| `Plan/collaboration/active/<handoff-id>-<topic>.md` | 临时正文；须经 create 或表登记后才由接收者使用 |
-
-仅自用说明写在自己的 `PLAN.md`。简单跨模块走一次性授权，不建 handoff。同 from+to+topic 已有 open/in-progress 时修订旧文档，不新建。验收后把状态改为 `completed` 或 `cancelled`（可直接改表）；功能完成后禁止再写归档、对接总结或多余对接文档。`cleanup` 再物理删除文档和关闭条目，不归档临时材料。open handoff 不阻止实现；`check-plan` 不因 handoff 失败。新建对接不得写入项目根目录、`doc/` 或 `docs/`。
-
-## 安全清理
-
-只对状态为 `completed` 或 `abandoned` 的计划运行：
-
-```bash
-python <skill-root>/scripts/vteam.py cleanup --project-root <project-root> --agent-id <agent-id>
-```
-
-正常完成计划必须满足：计划 review 已通过；至少一个功能任务；全部任务已完成；每项有测试结果和 7 至 40 位、可由 Git 解析为 commit 的本地提交哈希；相关 handoff 已关闭或转移。废弃计划必须记录非空放弃原因，已完成任务仍保留测试与提交证据。
-
-清理把活动 `PLAN.md` 重置为空白草稿，删除已关闭 handoff 登记的 `Plan/collaboration/active/` 临时文档，并移除 `completed`、`cancelled` 条目；不归档这些材料。活动计划或当前 Agent 参与的开放 handoff 必须拒绝清理。
-
-## 错误门禁
-
-| 情况 | 必须执行 |
-|---|---|
-| 无法确认 Agent ID | 停止并询问用户 |
-| `team.json` 缺失或无效 | 停止并指出具体字段 |
-| 个人 `AGENT.md` 缺失 | 先注册或重新生成身份 |
-| review 未通过或有阻塞项 | 修订计划并重新执行 `check-plan` |
-| 计划未批准 | 禁止实现代码 |
-| 测试失败 | 禁止提交并记录失败原因 |
-| 暂存 `Plan/` 路径（无用户明确授权） | 从暂存区移除；不得用白名单外一次性授权提交；仅用户明确要求后走 `plan-git allow-stage` |
-| 存在越界路径 | 请求当前提交的一次性授权 |
-| 本地提交失败 | 不得标记任务完成 |
-| 存在开放对接 | 保持 handoff 活动，不推断完成 |
-| 计划仍活动 | 禁止清理 |
-
-## 资源
-
-- `scripts/vteam.py`：`init`、`agent`、`context`、`check-plan`、`check-scope`、`cleanup`、`plan-git status|allow-stage|revoke`、`handoff list|show|create|doctor` 统一入口。
-- `references/root-agents-template.md`：Codex 项目根约束模板。
-- `references/root-claude-template.md`：Claude 项目根约束模板。
-- `references/personal-agent-template.md`：个人身份、边界和行为模板。
-- `references/quick-onboarding-template.md`：从用户身份和业务范围生成个人约束的提示模板。
-- `references/plan-template.md`：唯一活动计划模板（当前态 / 档案分区 + 协作依赖缓存表）。
-- `references/project-template.md`：项目当前态模板。
-- `references/handoffs-template.md`：开放对接当前态模板。
-- `references/team-template.json`：团队配置初始结构。
-
-所有脚本只依赖 Python 3 标准库和 Git，使用 `pathlib`、参数数组形式的 Git 子进程、UTF-8 文件与 Git 风格相对路径，兼容 Windows 和 macOS。
+- 用户可见或调用方可用的闭环已经实现；
+- 相关验收条件通过；
+- 跨角色契约已达到 `ready` 或 `verified`，消费者能定位真实来源；
+- 必要测试通过，失败和未覆盖项已明确；
+- 临时恢复状态已清除；
+- 没有为了“交付”额外制造无用途文档。

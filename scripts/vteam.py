@@ -1,2383 +1,617 @@
-"""description: 为 Codex 与 Claude 多 Agent 项目生成约束、身份和活动计划文件。"""
+"""V-Team 的轻量 capability 状态与契约索引工具。"""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 
+STATE_VERSION = 2
+STATE_RELATIVE_PATH = Path(".vteam/state.json")
 SKILL_ROOT = Path(__file__).resolve().parents[1]
-REFERENCES_ROOT = SKILL_ROOT / "references"
-VALID_RUNTIMES = {"codex", "claude"}
-TEMPLATE_MARKER_PATTERN = re.compile(r"\{\{[A-Z0-9_]+\}\}")
-PLAN_PATH_PREFIX = "Plan/"
-ACTIVE_HANDOFF_DOCUMENT_PREFIX = "Plan/collaboration/active/"
-HANDOFFS_RELATIVE_PATH = "Plan/collaboration/handoffs.md"
-ACTIVE_HANDOFF_STATUSES = frozenset({"open", "in-progress"})
-CLOSED_HANDOFF_STATUSES = frozenset({"completed", "cancelled"})
-VALID_HANDOFF_STATUSES = ACTIVE_HANDOFF_STATUSES | CLOSED_HANDOFF_STATUSES
-TOPIC_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
-HANDOFF_ID_PATTERN = re.compile(r"^H(\d+)$", re.IGNORECASE)
-LOCAL_EXCLUDE_BEGIN = "# v-team local collaboration artifacts: begin"
-LOCAL_EXCLUDE_END = "# v-team local collaboration artifacts: end"
-PLAN_GIT_ALLOW_FILENAME = "v-team-plan-git-allow"
-PLAN_GIT_CONFIRM_FLAG = "--i-confirm-user-explicitly-requested"
-
-
-class HandoffRejected(Exception):
-    """description: handoff 业务拒绝（例如重复 open），对应 CLI 退出码 2。"""
-
-
-def write_text(path: Path, content: str, overwrite: bool = True) -> None:
-    """description: 以统一编码和换行写入文本文件。
-
-    Args:
-        path: 目标文件路径。
-        content: 需要写入的完整文本。
-        overwrite: 文件存在时是否覆盖。
-
-    Returns:
-        None。
-
-    Raises:
-        OSError: 创建目录或写入文件失败。
-    """
-    if path.exists() and not overwrite:
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    normalized_content = content.rstrip() + "\n"
-    with path.open("w", encoding="utf-8", newline="\n") as output_file:
-        output_file.write(normalized_content)
-
-
-def resolve_git_common_dir(project_root: Path) -> Path | None:
-    """description: 解析项目根对应的 Git 公共目录；非 Git 仓库返回 None。
-
-    Args:
-        project_root: 可能是 Git 仓库的项目根目录。
-
-    Returns:
-        绝对路径形式的 Git 公共目录；`rev-parse` 失败时返回 None。
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "--git-common-dir"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if result.returncode != 0:
-        return None
-    raw_path = result.stdout.strip()
-    if not raw_path:
-        return None
-    git_dir = Path(raw_path)
-    if not git_dir.is_absolute():
-        git_dir = (project_root / git_dir).resolve()
-    return git_dir
-
-
-def resolve_git_exclude_path(project_root: Path) -> Path | None:
-    """description: 解析本地 exclude 文件路径；非 Git 仓库返回 None。
-
-    Args:
-        project_root: 可能是 Git 仓库的项目根目录。
-
-    Returns:
-        exclude 文件绝对路径；非 Git 时返回 None。
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "--git-path", "info/exclude"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if result.returncode != 0:
-        return None
-    raw_exclude_path = result.stdout.strip()
-    if not raw_exclude_path:
-        return None
-    exclude_path = Path(raw_exclude_path)
-    if not exclude_path.is_absolute():
-        exclude_path = project_root / exclude_path
-    return exclude_path
-
-
-def plan_git_allow_path(project_root: Path) -> Path | None:
-    """description: 返回用户明确授权「Plan 可进本地 Git」的标记文件路径。
-
-    Args:
-        project_root: 可能是 Git 仓库的项目根目录。
-
-    Returns:
-        `.git/.../v-team-plan-git-allow` 路径；非 Git 时返回 None。
-    """
-    git_dir = resolve_git_common_dir(project_root)
-    if git_dir is None:
-        return None
-    return git_dir / "info" / PLAN_GIT_ALLOW_FILENAME
-
-
-def is_plan_git_commit_allowed(project_root: Path) -> bool:
-    """description: 判断当前是否存在用户明确授权的 Plan 本地提交许可。
-
-    Args:
-        project_root: 项目根目录。
-
-    Returns:
-        标记文件存在则为 True；非 Git 或未授权为 False。
-    """
-    allow_path = plan_git_allow_path(project_root)
-    return allow_path is not None and allow_path.is_file()
-
-
-def ensure_local_plan_excluded(project_root: Path) -> None:
-    """description: 在已有 Git 仓库的本地排除规则中忽略 Plan 临时协作目录。
-
-    Args:
-        project_root: 可能是 Git 仓库的项目根目录。
-
-    Returns:
-        None。非 Git 目录保持无副作用，后续初始化 Git 后可再次运行本工具。
-        默认始终写入 `/Plan/` 排除；即使曾 force-add，日常 `git add .` 仍不会带上 Plan。
-
-    Raises:
-        OSError: Git 排除文件无法写入时抛出。
-    """
-    exclude_path = resolve_git_exclude_path(project_root)
-    if exclude_path is None:
-        return
-
-    current_content = (
-        exclude_path.read_text(encoding="utf-8")
-        if exclude_path.exists()
-        else ""
-    )
-    managed_block = f"{LOCAL_EXCLUDE_BEGIN}\n/Plan/\n{LOCAL_EXCLUDE_END}"
-    pattern = re.compile(
-        rf"^{re.escape(LOCAL_EXCLUDE_BEGIN)}\n.*?^{re.escape(LOCAL_EXCLUDE_END)}$",
-        re.MULTILINE | re.DOTALL,
-    )
-    if pattern.search(current_content):
-        updated_content = pattern.sub(managed_block, current_content)
-    else:
-        separator = "" if not current_content or current_content.endswith("\n") else "\n"
-        updated_content = f"{current_content}{separator}{managed_block}\n"
-
-    write_text(exclude_path, updated_content)
-
-
-def stage_plan_for_local_git(project_root: Path, confirmed: bool) -> list[str]:
-    """description: 在用户明确确认后，把 Plan/ 强制暂存进本地 Git（不推远程）。
-
-    Args:
-        project_root: 已是 Git 仓库的项目根。
-        confirmed: 必须为 True，表示用户已明确要求把 Plan 纳入本地仓库。
-
-    Returns:
-        本次强制暂存后，暂存区中以 `Plan/` 开头的路径列表。
-
-    Raises:
-        ValueError: 未确认、非 Git 仓库，或 Plan 目录不存在。
-        RuntimeError: git add -f 失败。
-        OSError: 无法写入授权标记或排除规则。
-    """
-    if not confirmed:
-        raise ValueError(
-            "必须由用户明确要求，并传入 "
-            f"{PLAN_GIT_CONFIRM_FLAG}；Agent 不得自行授权将 Plan/ 写入 Git。"
-        )
-    if resolve_git_common_dir(project_root) is None:
-        raise ValueError("项目根不是 Git 仓库，无法将 Plan/ 加入本地仓库")
-
-    plan_root = project_root / "Plan"
-    if not plan_root.is_dir():
-        raise ValueError(f"不存在 Plan 目录: {plan_root}")
-
-    ensure_local_plan_excluded(project_root)
-    allow_path = plan_git_allow_path(project_root)
-    if allow_path is None:
-        raise ValueError("无法解析 Git 目录，无法写入 Plan 提交授权")
-    allow_path.parent.mkdir(parents=True, exist_ok=True)
-    write_text(
-        allow_path,
-        (
-            "v-team plan-git allow\n"
-            "user explicitly requested local Plan commit\n"
-            "revoke with: vteam.py plan-git revoke\n"
-        ),
-    )
-
-    add_result = subprocess.run(
-        ["git", "add", "-f", "--", "Plan"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if add_result.returncode != 0:
-        error_message = add_result.stderr.strip() or "git add -f Plan 失败"
-        raise RuntimeError(error_message)
-
-    staged = [
-        path
-        for path in collect_staged_git_changes(project_root)
-        if path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
-    ]
-    if not staged:
-        raise RuntimeError("已授权但暂存区未出现 Plan/ 路径；请检查 Plan 内容与 Git 状态")
-    return staged
-
-
-def revoke_plan_git_allow(project_root: Path) -> bool:
-    """description: 撤销 Plan 本地 Git 提交授权，并重新确保 /Plan/ 被本地排除。
-
-    Args:
-        project_root: 项目根目录。
-
-    Returns:
-        True 表示删除了授权标记；False 表示本就没有授权或非 Git。
-
-    Raises:
-        OSError: 删除标记或写回 exclude 失败。
-    """
-    allow_path = plan_git_allow_path(project_root)
-    removed = False
-    if allow_path is not None and allow_path.is_file():
-        allow_path.unlink()
-        removed = True
-    ensure_local_plan_excluded(project_root)
-    return removed
-
-
-def plan_git_status(project_root: Path) -> dict[str, object]:
-    """description: 汇总 Plan 相对本地 Git 的排除与授权状态。
-
-    Args:
-        project_root: 项目根目录。
-
-    Returns:
-        含 is_git、excluded、allow_active、staged_plan_paths 等字段的字典。
-    """
-    is_git = resolve_git_common_dir(project_root) is not None
-    excluded = False
-    if is_git:
-        exclude_path = resolve_git_exclude_path(project_root)
-        if exclude_path is not None and exclude_path.is_file():
-            content = exclude_path.read_text(encoding="utf-8")
-            excluded = (
-                LOCAL_EXCLUDE_BEGIN in content
-                and "/Plan/" in content
-                and LOCAL_EXCLUDE_END in content
-            )
-    staged_plan: list[str] = []
-    if is_git:
-        try:
-            staged_plan = [
-                path
-                for path in collect_staged_git_changes(project_root)
-                if path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
-            ]
-        except RuntimeError:
-            staged_plan = []
-    return {
-        "is_git": is_git,
-        "excluded": excluded,
-        "allow_active": is_plan_git_commit_allowed(project_root),
-        "staged_plan_paths": staged_plan,
-        "plan_exists": (project_root / "Plan").is_dir(),
-    }
-
-
-def render_template(template_name: str, values: dict[str, str]) -> str:
-    """description: 渲染技能 references 目录中的文本模板。
-
-    Args:
-        template_name: references 目录下的模板文件名。
-        values: 模板标记与替换文本的映射，不包含花括号。
-
-    Returns:
-        已替换全部声明标记的模板文本。
-
-    Raises:
-        FileNotFoundError: 模板文件不存在。
-        ValueError: 渲染后仍存在未替换标记。
-        OSError: 模板读取失败。
-    """
-    template_path = REFERENCES_ROOT / template_name
-    content = template_path.read_text(encoding="utf-8")
-
-    for key, value in values.items():
-        marker = "{{" + key + "}}"
-        content = content.replace(marker, value)
-
-    unresolved_markers = TEMPLATE_MARKER_PATTERN.findall(content)
-    if unresolved_markers:
-        marker_text = ", ".join(sorted(set(unresolved_markers)))
-        raise ValueError(f"模板 {template_name} 存在未替换标记: {marker_text}")
-
-    return content
-
-
-def normalize_runtime_values(runtimes: Sequence[str]) -> list[str]:
-    """description: 校验运行端并按首次出现顺序去重。
-
-    Args:
-        runtimes: Codex 或 Claude 运行端名称序列。
-
-    Returns:
-        去重后的合法运行端列表。
-
-    Raises:
-        ValueError: 运行端为空或包含不支持的值。
-    """
-    normalized: list[str] = []
-    for raw_runtime in runtimes:
-        runtime = raw_runtime.strip().lower()
-        if runtime not in VALID_RUNTIMES:
-            raise ValueError(f"不支持的 runtime: {raw_runtime}")
-        if runtime not in normalized:
-            normalized.append(runtime)
-
-    if not normalized:
-        raise ValueError("至少需要一个 runtime: codex 或 claude")
-
-    return normalized
-
-
-def normalize_relative_path(raw_path: str) -> str:
-    """description: 把输入路径转换为安全的 Git 风格项目相对路径。
-
-    Args:
-        raw_path: Git 返回或用户提供的项目相对路径。
-
-    Returns:
-        使用正斜杠的项目相对路径；根规则返回点号，目录保留结尾斜杠。
-
-    Raises:
-        ValueError: 路径为空、为绝对路径、包含盘符或尝试逃逸项目根目录。
-    """
-    path_text = raw_path.strip().replace("\\", "/")
-    if not path_text:
-        raise ValueError("配置路径不能为空")
-    if path_text.startswith("/") or re.match(r"^[A-Za-z]:", path_text):
-        raise ValueError(f"配置路径必须是项目相对路径: {raw_path}")
-
-    if path_text in {".", "./"}:
-        return "."
-
-    keep_trailing_slash = path_text.endswith("/")
-    segments: list[str] = []
-    for segment in path_text.split("/"):
-        if segment in {"", "."}:
-            continue
-        if segment == "..":
-            raise ValueError(f"配置路径不能逃逸项目根目录: {raw_path}")
-        segments.append(segment)
-
-    if not segments:
-        raise ValueError(f"配置路径不能为空: {raw_path}")
-
-    normalized = "/".join(segments)
-    if keep_trailing_slash:
-        normalized += "/"
-    return normalized
-
-
-def normalize_config_path(raw_path: str) -> str:
-    """description: 规范化 team.json 中的模块、白名单或协作文档路径。
-
-    Args:
-        raw_path: 用户提供的项目相对路径或白名单规则。
-
-    Returns:
-        安全的 Git 风格项目相对路径。
-
-    Raises:
-        ValueError: 路径为空、为绝对路径、包含盘符或尝试路径逃逸。
-    """
-    return normalize_relative_path(raw_path)
-
-
-def decode_git_path(raw_path: str) -> str:
-    """description: 解码 Git 默认输出中的 C 风格引号与八进制 UTF-8 字节。
-
-    Args:
-        raw_path: Git 路径列表输出的一行路径。
-
-    Returns:
-        可直接规范化和匹配的 Unicode 路径。
-
-    Raises:
-        ValueError: 引号路径包含无效转义或字节不是合法 UTF-8。
-    """
-    if not raw_path.startswith('"') or not raw_path.endswith('"'):
-        return raw_path
-
-    content = raw_path[1:-1]
-    decoded_bytes = bytearray()
-    simple_escapes = {
-        "a": 7,
-        "b": 8,
-        "t": 9,
-        "n": 10,
-        "v": 11,
-        "f": 12,
-        "r": 13,
-        '"': 34,
-        "\\": 92,
-    }
-
-    index = 0
-    while index < len(content):
-        character = content[index]
-        if character != "\\":
-            decoded_bytes.extend(character.encode("utf-8"))
-            index += 1
-            continue
-
-        index += 1
-        if index >= len(content):
-            raise ValueError(f"Git 路径包含不完整转义: {raw_path}")
-
-        escaped = content[index]
-        if escaped in simple_escapes:
-            decoded_bytes.append(simple_escapes[escaped])
-            index += 1
-            continue
-
-        if escaped in "01234567":
-            octal_digits = escaped
-            index += 1
-            while index < len(content) and len(octal_digits) < 3:
-                if content[index] not in "01234567":
-                    break
-                octal_digits += content[index]
-                index += 1
-            decoded_bytes.append(int(octal_digits, 8))
-            continue
-
-        decoded_bytes.extend(escaped.encode("utf-8"))
-        index += 1
-
-    try:
-        return decoded_bytes.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"Git 路径不是有效 UTF-8: {raw_path}") from error
-
-
-def glob_to_regex(pattern: str) -> str:
-    """description: 把有限 Git 风格 glob 转换为不会跨错目录层级的正则表达式。
-
-    Args:
-        pattern: 已规范化且包含星号或问号的白名单规则。
-
-    Returns:
-        可用于整串匹配的正则表达式文本。
-
-    Raises:
-        无。
-    """
-    parts: list[str] = ["^"]
-    index = 0
-    while index < len(pattern):
-        character = pattern[index]
-        if character == "*":
-            if index + 1 < len(pattern) and pattern[index + 1] == "*":
-                parts.append(".*")
-                index += 2
-            else:
-                parts.append("[^/]*")
-                index += 1
-            continue
-        if character == "?":
-            parts.append("[^/]")
-            index += 1
-            continue
-        parts.append(re.escape(character))
-        index += 1
-    parts.append("$")
-    return "".join(parts)
-
-
-def path_is_allowed(
-    path: str,
-    patterns: Sequence[str],
-    case_sensitive: bool | None = None,
-) -> bool:
-    """description: 判断单个 Git 变更路径是否属于 Agent 永久白名单。
-
-    Args:
-        path: 需要检查的项目相对路径。
-        patterns: 精确文件、结尾斜杠目录、glob 或点号根规则列表。
-        case_sensitive: 显式大小写策略；为空时 Windows 不敏感，其他系统敏感。
-
-    Returns:
-        任一规则匹配时返回 True，否则返回 False。
-
-    Raises:
-        ValueError: 变更路径或白名单规则不是安全的项目相对路径。
-    """
-    normalized_path = normalize_relative_path(path)
-    use_case_sensitive = os.name != "nt" if case_sensitive is None else case_sensitive
-    comparable_path = normalized_path if use_case_sensitive else normalized_path.casefold()
-
-    for raw_pattern in patterns:
-        normalized_pattern = normalize_relative_path(raw_pattern)
-        comparable_pattern = (
-            normalized_pattern
-            if use_case_sensitive
-            else normalized_pattern.casefold()
-        )
-
-        if comparable_pattern == ".":
-            return True
-        if comparable_pattern.endswith("/"):
-            if comparable_path.startswith(comparable_pattern):
-                return True
-            continue
-        if "*" in comparable_pattern or "?" in comparable_pattern:
-            if re.fullmatch(glob_to_regex(comparable_pattern), comparable_path):
-                return True
-            continue
-        if comparable_path == comparable_pattern:
-            return True
-
-    return False
-
-
-def collect_staged_git_changes(project_root: Path) -> list[str]:
-    """description: 统一读取当前暂存区中准备进入本地提交的全部路径。
-
-    Args:
-        project_root: 已初始化 Git 仓库的项目根目录。
-
-    Returns:
-        已解码、规范化并去除空行的暂存路径列表。
-
-    Raises:
-        RuntimeError: Git 命令失败。
-        ValueError: Git 返回不安全或不可解码的路径。
-        OSError: Git 无法启动。
-    """
-    result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    if result.returncode != 0:
-        error_message = result.stderr.strip() or "git diff --cached 执行失败"
-        raise RuntimeError(error_message)
-
-    changed_paths: list[str] = []
-    for output_line in result.stdout.splitlines():
-        if not output_line.strip():
-            continue
-        decoded_path = decode_git_path(output_line.strip())
-        changed_paths.append(normalize_relative_path(decoded_path))
-    return changed_paths
-
-
-def check_scope(project_root: Path, agent_id: str) -> list[str]:
-    """description: 检查一次暂存内容是否可进入指定 Agent 的本地提交。
-
-    Args:
-        project_root: 包含 Git 仓库和 Plan/team.json 的项目根目录。
-        agent_id: 需要执行本地提交的 Agent ID。
-
-    Returns:
-        `Plan/` 路径和不在永久白名单内的全部暂存路径。
-
-    Raises:
-        ValueError: Agent ID 不存在或配置、路径无效。
-        RuntimeError: Git 差异读取失败。
-        OSError: 配置或 Git 读取失败。
-    """
-    normalized_agent_id = validate_agent_id(agent_id)
-    team = load_team(project_root)
-
-    matching_agent: dict[str, object] | None = None
-    for agent in team["agents"]:
-        if agent["id"] == normalized_agent_id:
-            matching_agent = agent
-            break
-    if matching_agent is None:
-        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
-
-    ensure_local_plan_excluded(project_root)
-    changed_paths = collect_staged_git_changes(project_root)
-    whitelist = matching_agent["write_whitelist"]
-    plan_commit_allowed = is_plan_git_commit_allowed(project_root)
-    violations: list[str] = []
-    for path in changed_paths:
-        is_plan_path = path.startswith(PLAN_PATH_PREFIX) or path == "Plan"
-        if is_plan_path:
-            if not plan_commit_allowed:
-                violations.append(path)
-            continue
-        if not path_is_allowed(path, whitelist):
-            violations.append(path)
-    return violations
-
-
-def parse_markdown_row(line: str, expected_cells: int) -> list[str] | None:
-    """description: 解析固定列数的 Markdown 表格数据行。
-
-    Args:
-        line: 可能属于表格的一整行文本。
-        expected_cells: 业务表格要求的列数。
-
-    Returns:
-        数据单元格列表；非表格行、表头或分隔行返回 None。
-
-    Raises:
-        ValueError: 行是 Markdown 表格但列数不符合约定。
-    """
-    stripped_line = line.strip()
-    if not stripped_line.startswith("|") or not stripped_line.endswith("|"):
-        return None
-
-    cells = [cell.strip() for cell in stripped_line[1:-1].split("|")]
-    if all(not cell or set(cell) <= {"-", ":"} for cell in cells):
-        return None
-    if cells and cells[0] in {"ID", "Id", "id"}:
-        return None
-    if len(cells) != expected_cells:
-        raise ValueError(
-            f"Markdown 表格列数错误，预期 {expected_cells} 列，实际 {len(cells)} 列: {line}"
-        )
-    return cells
-
-
-def extract_markdown_section(content: str, heading: str) -> str:
-    """description: 提取二级标题下直到下一个标题前的当前内容。
-
-    Args:
-        content: 完整 Markdown 文本。
-        heading: 不含井号的二级标题名称。
-
-    Returns:
-        去除首尾空白的段落文本；标题不存在时返回空字符串。
-
-    Raises:
-        无。
-    """
-    pattern = re.compile(
-        rf"^##\s+{re.escape(heading)}\s*$\n(?P<body>.*?)(?=^##\s+|\Z)",
-        re.MULTILINE | re.DOTALL,
-    )
-    match = pattern.search(content)
-    if match is None:
-        return ""
-    return match.group("body").strip()
-
-
-def read_plan_state(plan_path: Path) -> dict[str, object]:
-    """description: 解析个人活动计划的状态、审批、任务证据和放弃原因。
-
-    Args:
-        plan_path: `Plan/agents/<agent-id>/PLAN.md` 文件路径。
-
-    Returns:
-        包含原文、状态、审批、任务列表和放弃原因的字典。
-
-    Raises:
-        FileNotFoundError: 活动计划不存在。
-        ValueError: 必需元数据、任务表或表格格式无效。
-        OSError: 文件读取失败。
-    """
-    if not plan_path.is_file():
-        raise FileNotFoundError(f"缺少活动计划: {plan_path}")
-    content = plan_path.read_text(encoding="utf-8")
-
-    status_match = re.search(r"^- Status:\s*`([^`]+)`\s*$", content, re.MULTILINE)
-    if status_match is None:
-        raise ValueError("PLAN.md 缺少 `- Status: `<status>`` 元数据")
-    approval_match = re.search(
-        r"^- Approval:\s*`([^`]+)`\s*$",
-        content,
-        re.MULTILINE,
-    )
-    if approval_match is None:
-        raise ValueError("PLAN.md 缺少 `- Approval: `<status>`` 元数据")
-
-    review_matches: dict[str, re.Match[str] | None] = {
-        "review": re.search(r"^- Review:\s*`([^`]+)`\s*$", content, re.MULTILINE),
-        "blockers": re.search(r"^- Blockers:\s*`([^`]+)`\s*$", content, re.MULTILINE),
-        "reviewer": re.search(r"^- Reviewer:\s*`([^`]+)`\s*$", content, re.MULTILINE),
-        "scope": re.search(r"^- Scope:\s*`([^`]+)`\s*$", content, re.MULTILINE),
-        "review_tests": re.search(r"^- Tests:\s*`([^`]+)`\s*$", content, re.MULTILINE),
-        "required_changes": re.search(
-            r"^- Required changes:\s*`([^`]+)`\s*$",
-            content,
-            re.MULTILINE,
-        ),
-    }
-    missing_review_fields = [
-        name for name, match in review_matches.items() if match is None
-    ]
-    if missing_review_fields:
-        fields = ", ".join(missing_review_fields)
-        raise ValueError(f"PLAN.md 缺少 review 记录: {fields}")
-
-    task_heading = "| ID | 完整功能或明确修复 | 状态 | 测试结果 | 本地提交 |"
-    if task_heading not in content:
-        raise ValueError("PLAN.md 缺少固定功能任务表头")
-
-    def parse_task_section(section_name: str) -> list[dict[str, str]]:
-        section = extract_markdown_section(content, section_name)
-        parsed: list[dict[str, str]] = []
-        for line_number, line in enumerate(section.splitlines(), start=1):
-            try:
-                cells = parse_markdown_row(line, 5)
-            except ValueError as error:
-                raise ValueError(
-                    f"PLAN.md {section_name}表第 {line_number} 行错误: {error}"
-                ) from error
-            if cells is None:
-                continue
-            parsed.append(
-                {
-                    "id": cells[0],
-                    "summary": cells[1],
-                    "status": cells[2],
-                    "test_result": cells[3],
-                    "commit": cells[4],
-                }
-            )
-        return parsed
-
-    # 当前态「功能任务」+ 档案「已完成任务」合并，供 cleanup 证据校验。
-    open_tasks = parse_task_section("功能任务")
-    archived_tasks = parse_task_section("已完成任务")
-    tasks = open_tasks + archived_tasks
-
-    reason_section = extract_markdown_section(content, "放弃原因")
-    reason_lines = [
-        line.strip().removeprefix("-").strip()
-        for line in reason_section.splitlines()
-        if line.strip()
-    ]
-    abandoned_reason = " ".join(reason_lines).strip()
-    if abandoned_reason in {"-", "无", "无。"}:
-        abandoned_reason = ""
-
-    return {
-        "content": content,
-        "status": status_match.group(1).strip(),
-        "approval": approval_match.group(1).strip(),
-        "review": review_matches["review"].group(1).strip(),
-        "blockers": review_matches["blockers"].group(1).strip(),
-        "reviewer": review_matches["reviewer"].group(1).strip(),
-        "scope": review_matches["scope"].group(1).strip(),
-        "review_tests": review_matches["review_tests"].group(1).strip(),
-        "required_changes": review_matches["required_changes"].group(1).strip(),
-        "tasks": tasks,
-        "abandoned_reason": abandoned_reason,
-    }
-
-
-def parse_handoff_rows(handoffs_text: str) -> list[dict[str, str]]:
-    """description: 解析活动 handoff 表格中的业务数据行。
-
-    Args:
-        handoffs_text: `Plan/collaboration/handoffs.md` 完整文本。
-
-    Returns:
-        包含 ID、参与者、临时文档、交付物、验收条件、状态和原行的字典列表。
-
-    Raises:
-        ValueError: handoff 表格行列数或临时文档路径不符合格式。
-    """
-    rows: list[dict[str, str]] = []
-    for line_number, line in enumerate(handoffs_text.splitlines(), start=1):
-        stripped_line = line.strip()
-        if not stripped_line.startswith("|") or not stripped_line.endswith("|"):
-            continue
-        cells = [cell.strip() for cell in stripped_line[1:-1].split("|")]
-        if all(not cell or set(cell) <= {"-", ":"} for cell in cells):
-            continue
-        if cells and cells[0] in {"ID", "Id", "id"}:
-            continue
-        if len(cells) not in {6, 7}:
-            raise ValueError(
-                f"handoffs.md 第 {line_number} 行错误: 预期 6 或 7 列，实际 {len(cells)} 列: {line}"
-            )
-
-        # 六列表格来自旧版本，没有可删除的临时文档；新表格必须登记 Plan/ 下的路径。
-        document_path = "-" if len(cells) == 6 else cells[3]
-        if document_path not in {"", "-", "无", "无。"}:
-            normalized_path = normalize_relative_path(document_path)
-            if not normalized_path.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX):
-                raise ValueError(
-                    f"handoffs.md 第 {line_number} 行的对接文档必须位于 "
-                    f"{ACTIVE_HANDOFF_DOCUMENT_PREFIX}: {document_path}"
-                )
-            document_path = normalized_path
-
-        if len(cells) == 6:
-            deliverable, acceptance, status = cells[3], cells[4], cells[5]
-        else:
-            deliverable, acceptance, status = cells[4], cells[5], cells[6]
-        rows.append(
-            {
-                "id": cells[0],
-                "proposer": cells[1],
-                "receiver": cells[2],
-                "document_path": document_path,
-                "deliverable": deliverable,
-                "acceptance": acceptance,
-                "status": status,
-                "raw_line": line.strip(),
-            }
-        )
-    return rows
-
-
-def validate_cleanup_state(
-    plan_state: dict[str, object],
-    handoffs_text: str,
-    agent_id: str,
-    project_root: Path,
-) -> None:
-    """description: 校验计划状态、完成证据和跨 Agent 依赖满足清理条件。
-
-    Args:
-        plan_state: `read_plan_state` 返回的活动计划事实。
-        handoffs_text: 当前活动 handoff 文本。
-        agent_id: 正在清理计划的 Agent ID。
-
-    Returns:
-        None。
-
-    Raises:
-        ValueError: 计划仍活动、审批或证据不完整、放弃原因缺失、存在未关闭依赖。
-    """
-    status = plan_state["status"]
-    if status not in {"completed", "abandoned"}:
-        raise ValueError(
-            f"计划状态 {status} 仍是活动状态，只允许清理 completed 或 abandoned 计划"
-        )
-
-    tasks = plan_state["tasks"]
-    if status == "completed":
-        if plan_state["approval"] != "approved":
-            raise ValueError("completed 计划缺少 approved 用户审批记录")
-        validate_review_state(plan_state)
-        if not tasks:
-            raise ValueError("completed 计划至少需要一个完整功能或明确修复任务")
-        unfinished_task_ids = [
-            task["id"]
-            for task in tasks
-            if task["status"] != "completed"
-        ]
-        if unfinished_task_ids:
-            joined_ids = ", ".join(unfinished_task_ids)
-            raise ValueError(f"completed 计划仍有未完成任务: {joined_ids}")
-
-    if status == "abandoned" and not plan_state["abandoned_reason"]:
-        raise ValueError("abandoned 计划必须记录非空放弃原因")
-
-    commit_pattern = re.compile(r"^[0-9a-fA-F]{7,40}$")
-    for task in tasks:
-        if task["status"] != "completed":
-            continue
-        if task["test_result"] in {"", "-"}:
-            raise ValueError(f"已完成任务 {task['id']} 缺少测试结果")
-        if commit_pattern.fullmatch(task["commit"]) is None:
-            raise ValueError(f"已完成任务 {task['id']} 缺少有效本地提交哈希")
-        if not local_commit_exists(project_root, task["commit"]):
-            raise ValueError(f"已完成任务 {task['id']} 的本地提交不存在: {task['commit']}")
-
-    for handoff in parse_handoff_rows(handoffs_text):
-        if handoff["status"] not in VALID_HANDOFF_STATUSES:
-            raise ValueError(
-                f"对接 {handoff['id']} 使用未知状态: {handoff['status']}"
-            )
-        involves_agent = agent_id in {
-            handoff["proposer"],
-            handoff["receiver"],
-        }
-        if involves_agent and handoff["status"] in ACTIVE_HANDOFF_STATUSES:
-            raise ValueError(
-                f"存在当前 Agent 参与的未关闭对接 {handoff['id']}: {handoff['status']}"
-            )
-
-
-def review_value_is_empty(value: str) -> bool:
-    """description: 判断 review 固定字段是否仍为未填写占位值。"""
-    return value.strip().casefold() in {"", "-", "pending", "待补充", "待补充。"}
-
-
-def review_value_means_none(value: str) -> bool:
-    """description: 判断 review 问题字段是否明确表示没有待处理项。"""
-    normalized = value.strip().casefold().rstrip(".。")
-    return normalized in {"none", "无"}
-
-
-def validate_review_state(plan_state: dict[str, object]) -> None:
-    """description: 校验计划 review 已通过且没有待处理修改。"""
-    required_fields = {
-        "Reviewer": str(plan_state["reviewer"]),
-        "Scope": str(plan_state["scope"]),
-        "Tests": str(plan_state["review_tests"]),
-    }
-    empty_fields = [
-        name for name, value in required_fields.items() if review_value_is_empty(value)
-    ]
-    if empty_fields:
-        raise ValueError(f"review 缺少必填记录: {', '.join(empty_fields)}")
-    if str(plan_state["review"]).casefold() != "pass":
-        raise ValueError("review 尚未通过，不能进入后续流程")
-    if not review_value_means_none(str(plan_state["blockers"])):
-        raise ValueError("review 仍有阻塞项，不能进入后续流程")
-    if not review_value_means_none(str(plan_state["required_changes"])):
-        raise ValueError("review 仍有待修改项，不能进入后续流程")
-
-
-def local_commit_exists(project_root: Path, commit_hash: str) -> bool:
-    """description: 验证计划记录的本地提交哈希解析为真实 Git commit 对象。"""
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", f"{commit_hash}^{{commit}}"],
-        cwd=project_root,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    return result.returncode == 0
-
-
-def check_plan(project_root: Path, agent_id: str) -> None:
-    """description: 校验指定 Agent 的计划 review 已满足进入用户审批的条件。"""
-    normalized_agent_id = validate_agent_id(agent_id)
-    team = load_team(project_root)
-    registered_ids = {agent["id"] for agent in team["agents"]}
-    if normalized_agent_id not in registered_ids:
-        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
-
-    plan_path = project_root / "Plan" / "agents" / normalized_agent_id / "PLAN.md"
-    plan_state = read_plan_state(plan_path)
-    validate_review_state(plan_state)
-
-
-def remove_closed_handoffs(handoffs_text: str) -> tuple[str, list[dict[str, str]]]:
-    """description: 从活动 handoff 表移除已完成或已取消事项。
-
-    Args:
-        handoffs_text: 当前 handoffs.md 完整文本。
-
-    Returns:
-        精简后的活动文本，以及移除的 handoff 记录。
-
-    Raises:
-        ValueError: 表格格式错误。
-    """
-    closed_handoffs = [
-        handoff
-        for handoff in parse_handoff_rows(handoffs_text)
-        if handoff["status"] in CLOSED_HANDOFF_STATUSES
-    ]
-    closed_rows = {handoff["raw_line"] for handoff in closed_handoffs}
-    active_lines = [
-        line
-        for line in handoffs_text.splitlines()
-        if line.strip() not in closed_rows
-    ]
-    active_text = "\n".join(active_lines).rstrip() + "\n"
-    return active_text, closed_handoffs
-
-
-def remove_closed_handoff_documents(
-    project_root: Path,
-    closed_handoffs: Sequence[dict[str, str]],
-) -> list[Path]:
-    """description: 删除已关闭 handoff 登记的临时对接文档。
-
-    Args:
-        project_root: V-Team 项目根目录。
-        closed_handoffs: 已关闭 handoff 的解析记录。
-
-    Returns:
-        实际删除的项目相对文档路径。
-
-    Raises:
-        ValueError: 登记路径不属于 Plan 临时协作目录。
-        OSError: 文件删除失败。
-    """
-    deleted_paths: list[Path] = []
-    seen_paths: set[str] = set()
-    for handoff in closed_handoffs:
-        document_path = handoff["document_path"]
-        if document_path in {"", "-", "无", "无。"} or document_path in seen_paths:
-            continue
-        seen_paths.add(document_path)
-        normalized_path = normalize_relative_path(document_path)
-        if not normalized_path.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX):
-            raise ValueError(
-                f"已关闭对接 {handoff['id']} 的文档不在临时协作目录: {document_path}"
-            )
-        absolute_path = project_root / normalized_path
-        if absolute_path.exists():
-            absolute_path.unlink()
-            deleted_paths.append(Path(normalized_path))
-    return deleted_paths
-
-
-def handoffs_file_path(project_root: Path) -> Path:
-    """description: 返回项目 handoffs.md 路径。"""
-    return project_root / Path(HANDOFFS_RELATIVE_PATH)
-
-
-def active_handoff_directory(project_root: Path) -> Path:
-    """description: 返回临时对接文档目录。"""
-    return project_root / "Plan" / "collaboration" / "active"
-
-
-def load_handoffs_text(project_root: Path) -> str:
-    """description: 读取 handoffs.md；缺失时抛出 FileNotFoundError。"""
-    path = handoffs_file_path(project_root)
-    if not path.is_file():
-        raise FileNotFoundError(f"缺少协作文档: {path}")
-    return path.read_text(encoding="utf-8")
-
-
-def require_registered_agent(project_root: Path, agent_id: str) -> str:
-    """description: 校验 agent-id 已注册并返回规范化 ID。"""
-    normalized = validate_agent_id(agent_id)
-    team = load_team(project_root)
-    registered_ids = {agent["id"] for agent in team["agents"]}
-    if normalized not in registered_ids:
-        raise ValueError(f"team.json 中不存在 agent-id: {normalized}")
-    return normalized
-
-
-def parse_status_filter(raw_statuses: str | None) -> set[str]:
-    """description: 解析 list 的 status 过滤参数。"""
-    if raw_statuses is None or not raw_statuses.strip():
-        return set(ACTIVE_HANDOFF_STATUSES)
-    statuses = {part.strip() for part in raw_statuses.split(",") if part.strip()}
-    invalid = statuses - VALID_HANDOFF_STATUSES
-    if invalid:
-        joined = ", ".join(sorted(invalid))
-        raise ValueError(f"未知 handoff 状态: {joined}")
-    return statuses
-
-
-def document_exists(project_root: Path, document_path: str) -> bool:
-    """description: 判断登记的对接文档是否存在于磁盘。"""
-    if document_path in {"", "-", "无", "无。"}:
-        return False
-    return (project_root / document_path).is_file()
-
-
-def list_handoffs_for_agent(
-    project_root: Path,
-    agent_id: str,
-    role: str = "any",
-    statuses: set[str] | None = None,
-) -> list[dict[str, str]]:
-    """description: 按 Agent 与状态过滤活动对接行，并标注参与角色与文档是否存在。
-
-    Args:
-        project_root: 项目根目录。
-        agent_id: 当前 Agent ID。
-        role: receiver、proposer 或 any。
-        statuses: 状态集合；默认 open 与 in-progress。
-
-    Returns:
-        过滤后的 handoff 字典列表（含 role、doc_exists 字段）。
-    """
-    normalized_agent_id = require_registered_agent(project_root, agent_id)
-    if role not in {"any", "receiver", "proposer"}:
-        raise ValueError(f"未知 role: {role}，应为 receiver、proposer 或 any")
-    status_filter = set(ACTIVE_HANDOFF_STATUSES) if statuses is None else statuses
-    rows: list[dict[str, str]] = []
-    for handoff in parse_handoff_rows(load_handoffs_text(project_root)):
-        if handoff["status"] not in status_filter:
-            continue
-        is_receiver = handoff["receiver"] == normalized_agent_id
-        is_proposer = handoff["proposer"] == normalized_agent_id
-        if role == "receiver" and not is_receiver:
-            continue
-        if role == "proposer" and not is_proposer:
-            continue
-        if role == "any" and not (is_receiver or is_proposer):
-            continue
-        if is_receiver and is_proposer:
-            participation = "both"
-        elif is_receiver:
-            participation = "receiver"
-        else:
-            participation = "proposer"
-        enriched = dict(handoff)
-        enriched["role"] = participation
-        enriched["doc_exists"] = (
-            "true"
-            if document_exists(project_root, handoff["document_path"])
-            else "false"
-        )
-        rows.append(enriched)
-    return rows
-
-
-def format_handoff_list(rows: Sequence[dict[str, str]]) -> str:
-    """description: 将 handoff 列表格式化为 Agent 可抄写进 PLAN 的稳定文本。"""
-    if not rows:
-        return "没有匹配的对接事项。\n"
-    blocks: list[str] = []
-    for handoff in rows:
-        blocks.append(
-            "\n".join(
-                [
-                    f"HANDOFF {handoff['id']} status={handoff['status']} "
-                    f"role={handoff['role']}",
-                    f"  from: {handoff['proposer']}",
-                    f"  to: {handoff['receiver']}",
-                    f"  doc: {handoff['document_path']}",
-                    f"  doc_exists: {handoff['doc_exists']}",
-                    f"  deliverable: {handoff['deliverable']}",
-                    f"  acceptance: {handoff['acceptance']}",
-                ]
-            )
-        )
-    return "\n\n".join(blocks) + "\n"
-
-
-def show_handoff(project_root: Path, handoff_id: str) -> dict[str, str]:
-    """description: 按 ID 返回单条 handoff；不存在时抛出 ValueError。"""
-    target = handoff_id.strip()
-    for handoff in parse_handoff_rows(load_handoffs_text(project_root)):
-        if handoff["id"] == target:
-            enriched = dict(handoff)
-            enriched["role"] = "-"
-            enriched["doc_exists"] = (
-                "true"
-                if document_exists(project_root, handoff["document_path"])
-                else "false"
-            )
-            return enriched
-    raise ValueError(f"未找到对接 ID: {target}")
-
-
-def validate_topic(topic: str) -> str:
-    """description: 校验对接主题 slug。"""
-    normalized = topic.strip()
-    if not TOPIC_PATTERN.fullmatch(normalized):
-        raise ValueError(
-            "topic 必须为 1–64 位、以字母或数字开头，且仅含字母、数字、_ 或 -"
-        )
-    return normalized
-
-
-def next_handoff_id(existing_rows: Sequence[dict[str, str]]) -> str:
-    """description: 生成下一个 Hn 形式的对接 ID。"""
-    max_number = 0
-    for handoff in existing_rows:
-        match = HANDOFF_ID_PATTERN.fullmatch(handoff["id"])
-        if match:
-            max_number = max(max_number, int(match.group(1)))
-    return f"H{max_number + 1}"
-
-
-def build_handoff_document_body(
-    handoff_id: str,
-    proposer: str,
-    receiver: str,
-    topic: str,
-    deliverable: str,
-    acceptance: str,
-) -> str:
-    """description: 生成临时对接文档最小正文。"""
+ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+ROLE_PATTERN = re.compile(
+    r"^(requirement|product|architect|backend|frontend|qa)"
+    r"(?:-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?$"
+)
+ROLE_REFERENCES = {
+    "requirement": "references/role-requirement.md",
+    "product": "references/role-requirement.md",
+    "architect": "references/role-architect.md",
+    "backend": "references/role-backend.md",
+    "frontend": "references/role-frontend.md",
+    "qa": "references/role-qa.md",
+}
+CONTRACT_SOURCES = (
+    "openapi",
+    "graphql",
+    "protobuf",
+    "json-schema",
+    "shared-types",
+    "contract-test",
+)
+PUBLISHABLE_STATUSES = ("draft", "ready", "blocked")
+DISCOVERABLE_STATUSES = frozenset({"draft", "ready", "verified", "blocked"})
+INTEGRATION_STATUSES = frozenset({"ready", "verified"})
+
+
+class VTeamError(Exception):
+    """可向用户说明的输入或状态错误。"""
+
+    exit_code = 2
+
+
+class SelectionRequired(VTeamError):
+    """发现多个契约，需要调用方明确选择。"""
+
+    exit_code = 3
+
+
+def utc_now() -> str:
+    """返回秒级 UTC 时间，便于人和工具共同读取。"""
     return (
-        f"# 对接 {handoff_id}: {topic}\n\n"
-        f"- 提出者: `{proposer}`\n"
-        f"- 接收者: `{receiver}`\n"
-        f"- 交付物: {deliverable}\n"
-        f"- 验收条件: {acceptance}\n\n"
-        "## 接口 / 契约正文\n\n"
-        "（由提出者填写；接收者只读本文件中与集成相关的约定。）\n\n"
-        "## 修订记录\n\n"
-        f"- 创建: {handoff_id} open\n"
+        datetime.now(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
     )
 
 
-def append_handoff_table_row(handoffs_text: str, row_line: str) -> str:
-    """description: 在 handoffs.md 表格末尾追加一行数据。"""
-    lines = handoffs_text.splitlines()
-    last_table_index = -1
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("|") and stripped.endswith("|"):
-            last_table_index = index
-    if last_table_index < 0:
-        raise ValueError("handoffs.md 缺少可追加的对接表格")
-    lines.insert(last_table_index + 1, row_line)
-    return "\n".join(lines).rstrip() + "\n"
+def project_root_from(value: str) -> Path:
+    root = Path(value).expanduser().resolve()
+    if not root.is_dir():
+        raise VTeamError(f"项目目录不存在: {root}")
+    return root
 
 
-def create_handoff(
-    project_root: Path,
-    proposer: str,
-    receiver: str,
-    topic: str,
-    deliverable: str,
-    acceptance: str,
-    handoff_id: str | None = None,
-) -> dict[str, str]:
-    """description: 登记对接并写入 active 临时文档。
+def state_path(project_root: Path) -> Path:
+    return project_root / STATE_RELATIVE_PATH
 
-    Raises:
-        HandoffRejected: 同 from+to+topic 已有 open/in-progress，或 ID 冲突。
-        ValueError: 参数非法或 Agent 未注册。
-    """
-    proposer_id = require_registered_agent(project_root, proposer)
-    receiver_id = require_registered_agent(project_root, receiver)
-    topic_slug = validate_topic(topic)
-    deliverable_text = deliverable.strip()
-    acceptance_text = acceptance.strip()
-    if not deliverable_text:
-        raise ValueError("deliverable 不能为空")
-    if not acceptance_text:
-        raise ValueError("acceptance 不能为空")
 
-    handoffs_text = load_handoffs_text(project_root)
-    existing = parse_handoff_rows(handoffs_text)
-    for handoff in existing:
-        if (
-            handoff["proposer"] == proposer_id
-            and handoff["receiver"] == receiver_id
-            and handoff["status"] in ACTIVE_HANDOFF_STATUSES
-        ):
-            existing_topic = ""
-            doc = handoff["document_path"]
-            if doc.startswith(ACTIVE_HANDOFF_DOCUMENT_PREFIX) and doc.endswith(".md"):
-                name = doc[len(ACTIVE_HANDOFF_DOCUMENT_PREFIX) : -3]
-                prefix = f"{handoff['id']}-"
-                if name.startswith(prefix):
-                    existing_topic = name[len(prefix) :]
-            if existing_topic == topic_slug:
-                raise HandoffRejected(
-                    f"已存在相同主题的活动对接 {handoff['id']}: "
-                    f"{handoff['document_path']}；请修订旧文档，不要新建"
-                )
-
-    if handoff_id is None or not handoff_id.strip():
-        new_id = next_handoff_id(existing)
-    else:
-        new_id = handoff_id.strip()
-        if any(row["id"] == new_id for row in existing):
-            raise HandoffRejected(f"对接 ID 已存在: {new_id}")
-
-    document_path = f"{ACTIVE_HANDOFF_DOCUMENT_PREFIX}{new_id}-{topic_slug}.md"
-    absolute_document = project_root / document_path
-    if absolute_document.exists():
-        raise HandoffRejected(f"对接文档已存在: {document_path}")
-
-    row_line = (
-        f"| {new_id} | {proposer_id} | {receiver_id} | {document_path} | "
-        f"{deliverable_text} | {acceptance_text} | open |"
-    )
-    updated_text = append_handoff_table_row(handoffs_text, row_line)
-    body = build_handoff_document_body(
-        new_id,
-        proposer_id,
-        receiver_id,
-        topic_slug,
-        deliverable_text,
-        acceptance_text,
-    )
-    write_text(handoffs_file_path(project_root), updated_text)
-    write_text(absolute_document, body)
+def empty_state(project_root: Path) -> dict[str, Any]:
     return {
-        "id": new_id,
-        "proposer": proposer_id,
-        "receiver": receiver_id,
-        "document_path": document_path,
-        "deliverable": deliverable_text,
-        "acceptance": acceptance_text,
-        "status": "open",
-        "topic": topic_slug,
+        "schema_version": STATE_VERSION,
+        "project": project_root.name,
+        "capabilities": {},
+        "contracts": {},
+        "active": {},
+        "milestones": [],
     }
 
 
-def collect_handoff_doctor_issues(project_root: Path) -> list[str]:
-    """description: 收集 handoff 卫生问题（孤儿文件、缺失路径、无效 Agent）。"""
-    team = load_team(project_root)
-    registered_ids = {agent["id"] for agent in team["agents"]}
-    handoffs_text = load_handoffs_text(project_root)
-    rows = parse_handoff_rows(handoffs_text)
-    registered_docs: set[str] = set()
-    issues: list[str] = []
-
-    for handoff in rows:
-        doc = handoff["document_path"]
-        if doc not in {"", "-", "无", "无。"}:
-            registered_docs.add(doc)
-            if not document_exists(project_root, doc):
-                issues.append(f"missing: {handoff['id']} -> {doc}")
-        if handoff["proposer"] not in registered_ids:
-            issues.append(
-                f"invalid_agent: {handoff['id']} proposer={handoff['proposer']}"
-            )
-        if handoff["receiver"] not in registered_ids:
-            issues.append(
-                f"invalid_agent: {handoff['id']} receiver={handoff['receiver']}"
-            )
-
-    active_dir = active_handoff_directory(project_root)
-    if active_dir.is_dir():
-        for path in sorted(active_dir.rglob("*")):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(project_root).as_posix()
-            if relative not in registered_docs:
-                issues.append(f"orphan: {relative}")
-    return issues
-
-
-def format_doctor_report(issues: Sequence[str]) -> str:
-    """description: 格式化 doctor 报告文本。"""
-    if not issues:
-        return "handoff doctor: 未发现问题。\n"
-    lines = ["handoff doctor: 发现问题:"]
-    lines.extend(f"- {issue}" for issue in issues)
-    return "\n".join(lines) + "\n"
-
-
-def count_orphan_active_documents(project_root: Path) -> int:
-    """description: 统计 active 目录中未登记的文件数量。"""
-    return sum(
-        1
-        for issue in collect_handoff_doctor_issues(project_root)
-        if issue.startswith("orphan:")
-    )
-
-
-def cleanup_agent_plan(project_root: Path, agent_id: str) -> list[Path]:
-    """description: 重置完成或废弃计划，并删除已关闭 handoff 的临时文档。
-
-    Args:
-        project_root: 已初始化的 V-Team 项目根目录。
-        agent_id: 需要清理活动计划的 Agent ID。
-
-    Returns:
-        已删除的临时对接文档路径。
-
-    Raises:
-        FileNotFoundError: 个人计划或 handoff 文档不存在。
-        ValueError: Agent 不存在、计划或协作状态不满足清理条件。
-        OSError: 文件读取或写入失败。
-    """
-    normalized_agent_id = validate_agent_id(agent_id)
-    team = load_team(project_root)
-    registered_ids = {agent["id"] for agent in team["agents"]}
-    if normalized_agent_id not in registered_ids:
-        raise ValueError(f"team.json 中不存在 agent-id: {normalized_agent_id}")
-
-    plan_path = (
-        project_root
-        / "Plan"
-        / "agents"
-        / normalized_agent_id
-        / "PLAN.md"
-    )
-    handoffs_path = handoffs_file_path(project_root)
-    if not handoffs_path.is_file():
-        raise FileNotFoundError(f"缺少协作文档: {handoffs_path}")
-
-    plan_state = read_plan_state(plan_path)
-    handoffs_text = handoffs_path.read_text(encoding="utf-8")
-    validate_cleanup_state(
-        plan_state,
-        handoffs_text,
-        normalized_agent_id,
-        project_root,
-    )
-    active_handoffs, closed_handoffs = remove_closed_handoffs(handoffs_text)
-
-    reset_plan = render_template(
-        "plan-template.md",
-        {"AGENT_ID": normalized_agent_id},
-    )
-    write_text(plan_path, reset_plan)
-    write_text(handoffs_path, active_handoffs)
-    return remove_closed_handoff_documents(project_root, closed_handoffs)
-
-
-def validate_agent_id(agent_id: str) -> str:
-    """description: 校验 Agent ID 可以安全用作单级目录名。
-
-    Args:
-        agent_id: 用户指定的 Agent 唯一身份。
-
-    Returns:
-        去除首尾空白后的 Agent ID。
-
-    Raises:
-        ValueError: ID 为空、为点目录或包含路径分隔符。
-    """
-    normalized = agent_id.strip()
-    if not normalized:
-        raise ValueError("agent-id 不能为空")
-    if normalized in {".", ".."} or "/" in normalized or "\\" in normalized:
-        raise ValueError(f"agent-id 不能包含路径分隔符: {agent_id}")
-    return normalized
-
-
-def validate_team(team: dict[str, object]) -> None:
-    """description: 校验 team.json 顶层结构与每个 Agent 的必需字段。
-
-    Args:
-        team: 解析后的团队配置对象。
-
-    Returns:
-        None。
-
-    Raises:
-        ValueError: 必需字段缺失、类型错误、值非法或 Agent ID 重复。
-    """
-    if not isinstance(team, dict):
-        raise ValueError("team.json 顶层必须是 JSON 对象")
-
-    project_name = team.get("project_name")
-    if not isinstance(project_name, str) or not project_name.strip():
-        raise ValueError("team.json 字段 project_name 必须是非空字符串")
-
-    runtimes = team.get("runtimes")
-    if not isinstance(runtimes, list):
-        raise ValueError("team.json 字段 runtimes 必须是数组")
-    if any(not isinstance(runtime, str) for runtime in runtimes):
-        raise ValueError("team.json 字段 runtimes 只能包含字符串")
-    normalized_runtimes = normalize_runtime_values(runtimes)
-    if normalized_runtimes != runtimes:
-        raise ValueError("team.json 字段 runtimes 包含重复值或非规范值")
-
-    agents = team.get("agents")
-    if not isinstance(agents, list):
-        raise ValueError("team.json 字段 agents 必须是数组")
-
-    seen_agent_ids: set[str] = set()
-    required_fields = {
-        "id": str,
-        "runtime": str,
-        "role": str,
-        "responsibility": str,
-        "modules": list,
-        "write_whitelist": list,
-        "collaboration_docs": list,
-    }
-    for index, agent in enumerate(agents):
-        if not isinstance(agent, dict):
-            raise ValueError(f"team.json 字段 agents[{index}] 必须是对象")
-        for field_name, expected_type in required_fields.items():
-            field_value = agent.get(field_name)
-            if not isinstance(field_value, expected_type):
-                raise ValueError(
-                    f"team.json 字段 agents[{index}].{field_name} 类型错误"
-                )
-
-        scope_statement = agent.get("scope_statement")
-        if scope_statement is not None and (
-            not isinstance(scope_statement, str) or not scope_statement.strip()
-        ):
-            raise ValueError(
-                f"team.json 字段 agents[{index}].scope_statement 必须是非空字符串"
-            )
-
-        agent_id = validate_agent_id(agent["id"])
-        if agent_id in seen_agent_ids:
-            raise ValueError(f"team.json 存在重复 agent id: {agent_id}")
-        seen_agent_ids.add(agent_id)
-
-        if agent["runtime"] not in VALID_RUNTIMES:
-            raise ValueError(
-                f"team.json 字段 agents[{index}].runtime 值非法: {agent['runtime']}"
-            )
-
-        for list_field in ["modules", "write_whitelist", "collaboration_docs"]:
-            list_value = agent[list_field]
-            if any(not isinstance(item, str) for item in list_value):
-                raise ValueError(
-                    f"team.json 字段 agents[{index}].{list_field} 只能包含字符串"
-                )
-            for item in list_value:
-                normalize_config_path(item)
-
-
-def load_team(project_root: Path) -> dict[str, object]:
-    """description: 读取并校验项目团队配置。
-
-    Args:
-        project_root: 包含 Plan/team.json 的项目根目录。
-
-    Returns:
-        已通过结构校验的团队配置对象。
-
-    Raises:
-        FileNotFoundError: team.json 不存在。
-        ValueError: JSON 无法解析或配置结构错误。
-        OSError: 文件读取失败。
-    """
-    team_path = project_root / "Plan" / "team.json"
-    if not team_path.is_file():
-        raise FileNotFoundError(f"缺少团队配置: {team_path}")
-
+def load_state(project_root: Path) -> tuple[dict[str, Any], bool]:
+    path = state_path(project_root)
+    if not path.exists():
+        return empty_state(project_root), False
     try:
-        team = json.loads(team_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            f"team.json JSON 格式错误，第 {error.lineno} 行第 {error.colno} 列"
-        ) from error
-
-    validate_team(team)
-    return team
-
-
-def save_team(project_root: Path, team: dict[str, object]) -> None:
-    """description: 校验并保存项目团队配置。
-
-    Args:
-        project_root: 项目根目录。
-        team: 需要保存的完整团队配置。
-
-    Returns:
-        None。
-
-    Raises:
-        ValueError: 配置结构无效。
-        OSError: 文件写入失败。
-    """
-    validate_team(team)
-    content = json.dumps(team, ensure_ascii=False, indent=2)
-    write_text(project_root / "Plan" / "team.json", content)
-
-
-def format_markdown_list(values: Sequence[str]) -> str:
-    """description: 把配置值渲染为 Markdown 列表。
-
-    Args:
-        values: 需要展示的文本序列。
-
-    Returns:
-        每行一个反引号条目的 Markdown 文本；空序列返回未配置提示。
-
-    Raises:
-        无。
-    """
-    if not values:
-        return "- （未配置）"
-    return "\n".join(f"- `{value}`" for value in values)
-
-
-def refresh_root_rules(project_root: Path, runtimes: Sequence[str]) -> None:
-    """description: 根据项目运行端生成 Codex 或 Claude 根约束文件。
-
-    Args:
-        project_root: 项目根目录。
-        runtimes: 已校验的项目运行端序列。
-
-    Returns:
-        None。
-
-    Raises:
-        FileNotFoundError: 根约束模板不存在。
-        ValueError: 模板存在未替换标记。
-        OSError: 模板读取或目标写入失败。
-    """
-    normalized_runtimes = normalize_runtime_values(runtimes)
-    runtime_templates = {
-        "codex": ("root-agents-template.md", "AGENTS.md"),
-        "claude": ("root-claude-template.md", "CLAUDE.md"),
-    }
-
-    for runtime in normalized_runtimes:
-        template_name, output_name = runtime_templates[runtime]
-        content = render_template(template_name, {})
-        write_text(project_root / output_name, content)
-
-
-def initialize_project(project_root: Path, runtimes: Sequence[str]) -> None:
-    """description: 初始化无版本的多 Agent 项目管理结构。
-
-    Args:
-        project_root: 需要初始化的项目根目录。
-        runtimes: 项目使用的 Codex、Claude 运行端序列。
-
-    Returns:
-        None。
-
-    Raises:
-        ValueError: 运行端或已有团队配置无效。
-        OSError: 目录或文件创建失败。
-    """
-    normalized_runtimes = normalize_runtime_values(runtimes)
-    project_root.mkdir(parents=True, exist_ok=True)
-
-    # 先创建固定目录，确保临时协作材料只在 Plan 内流转。
-    plan_root = project_root / "Plan"
-    (plan_root / "agents").mkdir(parents=True, exist_ok=True)
-    (plan_root / "collaboration" / "active").mkdir(parents=True, exist_ok=True)
-
-    team_path = plan_root / "team.json"
-    if team_path.exists():
-        team = load_team(project_root)
-        existing_runtimes = team["runtimes"]
-        team["runtimes"] = normalize_runtime_values(
-            [*existing_runtimes, *normalized_runtimes]
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VTeamError(f"无法读取 {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise VTeamError(f"状态文件根节点必须是 JSON object: {path}")
+    if data.get("schema_version") != STATE_VERSION:
+        raise VTeamError(
+            f"不支持的状态版本 {data.get('schema_version')!r}；"
+            f"当前需要 {STATE_VERSION}"
         )
+    expected_types = {
+        "capabilities": dict,
+        "contracts": dict,
+        "active": dict,
+        "milestones": list,
+    }
+    for field, expected_type in expected_types.items():
+        if not isinstance(data.get(field), expected_type):
+            raise VTeamError(f"状态字段 {field} 必须是 {expected_type.__name__}")
+    return data, True
+
+
+def save_state(project_root: Path, data: dict[str, Any]) -> Path:
+    """原子覆盖唯一状态文件，不产生历史副本。"""
+    path = state_path(project_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    with temporary.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(payload)
+    temporary.replace(path)
+    return path
+
+
+def validate_id(value: str, label: str) -> str:
+    if not ID_PATTERN.fullmatch(value):
+        raise VTeamError(
+            f"{label} 必须以小写字母或数字开头，且只含小写字母、数字、点、"
+            f"下划线或短横线: {value!r}"
+        )
+    return value
+
+
+def role_discipline(role_id: str) -> str:
+    match = ROLE_PATTERN.fullmatch(role_id)
+    if not match:
+        raise VTeamError(
+            "角色 ID 必须是 <职能>-<功能范围>，职能只能是 "
+            "requirement/product/architect/backend/frontend/qa: "
+            f"{role_id!r}"
+        )
+    return match.group(1)
+
+
+def unique(values: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(values))
+
+
+def contract_for_output(contract: dict[str, Any]) -> dict[str, Any]:
+    result = dict(contract)
+    result["integration_allowed"] = contract.get("status") in INTEGRATION_STATUSES
+    return result
+
+
+def emit(payload: Any, json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     else:
-        team_content = render_template(
-            "team-template.json",
-            {
-                "PROJECT_NAME_JSON": json.dumps(
-                    project_root.name,
-                    ensure_ascii=False,
-                ),
-                "RUNTIMES_JSON": json.dumps(
-                    normalized_runtimes,
-                    ensure_ascii=False,
-                ),
-            },
-        )
-        team = json.loads(team_content)
-
-    save_team(project_root, team)
-
-    # 当前态文档只在缺失时创建，避免重复初始化覆盖真实项目进度。
-    initial_files = {
-        plan_root / "project.md": "project-template.md",
-        plan_root / "onboarding.md": "quick-onboarding-template.md",
-        plan_root / "collaboration" / "handoffs.md": "handoffs-template.md",
-    }
-    for output_path, template_name in initial_files.items():
-        write_text(output_path, render_template(template_name, {}), overwrite=False)
-
-    ensure_local_plan_excluded(project_root)
-    refresh_root_rules(project_root, team["runtimes"])
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 
-def upsert_agent(
-    project_root: Path,
-    agent_id: str,
-    runtime: str,
-    role: str,
-    responsibility: str,
-    modules: Sequence[str],
-    write_whitelist: Sequence[str],
-    collaboration_docs: Sequence[str],
-    scope_statement: str | None = None,
-) -> None:
-    """description: 新增或更新 Agent 身份事实与个人约束文件。
-
-    Args:
-        project_root: 已初始化的项目根目录。
-        agent_id: Agent 唯一身份，也是个人目录名。
-        runtime: Agent 使用的 codex 或 claude 运行端。
-        role: Agent 在项目中的角色名称。
-        responsibility: Agent 的主要职责描述。
-        modules: Agent 默认负责的模块路径。
-        write_whitelist: 无需额外授权即可提交的路径规则。
-        collaboration_docs: 当前任务可能需要读取的协作文档路径。
-        scope_statement: 用户以自然语言授权的业务或项目范围；未提供时使用职责描述。
-
-    Returns:
-        None。
-
-    Raises:
-        FileNotFoundError: 项目尚未初始化。
-        ValueError: 身份、运行端、职责或路径配置无效。
-        OSError: 配置或个人文件写入失败。
-    """
-    normalized_agent_id = validate_agent_id(agent_id)
-    normalized_runtime = normalize_runtime_values([runtime])[0]
-    normalized_role = role.strip()
-    normalized_responsibility = responsibility.strip()
-    normalized_scope = (
-        scope_statement.strip()
-        if scope_statement is not None
-        else normalized_responsibility
-    )
-    if not normalized_role:
-        raise ValueError("role 不能为空")
-    if not normalized_responsibility:
-        raise ValueError("responsibility 不能为空")
-    if not normalized_scope:
-        raise ValueError("scope 不能为空")
-
-    normalized_modules = [normalize_config_path(path) for path in modules]
-    normalized_whitelist = [normalize_config_path(path) for path in write_whitelist]
-    normalized_docs = [normalize_config_path(path) for path in collaboration_docs]
-    if not normalized_whitelist:
-        raise ValueError("至少需要一个 --allow 白名单路径")
-
-    team = load_team(project_root)
-    agent_config = {
-        "id": normalized_agent_id,
-        "runtime": normalized_runtime,
-        "role": normalized_role,
-        "responsibility": normalized_responsibility,
-        "scope_statement": normalized_scope,
-        "modules": normalized_modules,
-        "write_whitelist": normalized_whitelist,
-        "collaboration_docs": normalized_docs,
-    }
-
-    # 使用 Agent ID 定位更新位置，同角色 Agent 不会互相覆盖。
-    agents = team["agents"]
-    updated_agents: list[dict[str, object]] = []
-    found_existing = False
-    for existing_agent in agents:
-        if existing_agent["id"] == normalized_agent_id:
-            updated_agents.append(agent_config)
-            found_existing = True
-        else:
-            updated_agents.append(existing_agent)
-    if not found_existing:
-        updated_agents.append(agent_config)
-
-    team["agents"] = updated_agents
-    team["runtimes"] = normalize_runtime_values(
-        [*team["runtimes"], normalized_runtime]
-    )
-    save_team(project_root, team)
-
-    personal_rules = render_template(
-        "personal-agent-template.md",
-        {
-            "AGENT_ID": normalized_agent_id,
-            "RUNTIME": normalized_runtime,
-            "ROLE": normalized_role,
-            "RESPONSIBILITY": normalized_responsibility,
-            "SCOPE_STATEMENT": normalized_scope,
-            "MODULES": format_markdown_list(normalized_modules),
-            "WRITE_WHITELIST": format_markdown_list(normalized_whitelist),
-            "COLLABORATION_DOCS": format_markdown_list(normalized_docs),
-        },
-    )
-    agent_root = project_root / "Plan" / "agents" / normalized_agent_id
-    write_text(agent_root / "AGENT.md", personal_rules)
-
-    plan_content = render_template(
-        "plan-template.md",
-        {"AGENT_ID": normalized_agent_id},
-    )
-    write_text(agent_root / "PLAN.md", plan_content, overwrite=False)
-    ensure_local_plan_excluded(project_root)
-    refresh_root_rules(project_root, team["runtimes"])
-
-
-def find_agent_record(project_root: Path, agent_id: str) -> dict[str, object]:
-    """description: 返回已注册 Agent 的 team.json 记录。"""
-    normalized = require_registered_agent(project_root, agent_id)
-    team = load_team(project_root)
-    for agent in team["agents"]:
-        if agent["id"] == normalized:
-            return agent
-    raise ValueError(f"team.json 中不存在 agent-id: {normalized}")
-
-
-def build_agent_context(project_root: Path, agent_id: str) -> dict[str, object]:
-    """description: 生成会话冷启动索引：身份、白名单、计划摘要与必读 handoff 路径。
-
-    Args:
-        project_root: 项目根目录。
-        agent_id: 已注册的 Agent ID。
-
-    Returns:
-        供 format_agent_context / JSON 输出的上下文字典。不替代 Read 合同正文。
-
-    Raises:
-        FileNotFoundError / ValueError: 身份或计划缺失、结构无效。
-    """
-    normalized = require_registered_agent(project_root, agent_id)
-    agent = find_agent_record(project_root, normalized)
-    plan_path = project_root / "Plan" / "agents" / normalized / "PLAN.md"
-    agent_path = project_root / "Plan" / "agents" / normalized / "AGENT.md"
-    project_md = project_root / "Plan" / "project.md"
-
-    plan_meta: dict[str, object] = {
-        "path": f"Plan/agents/{normalized}/PLAN.md",
-        "exists": plan_path.is_file(),
-        "status": None,
-        "approval": None,
-        "current_goal": None,
-        "blockers_next": None,
-        "open_tasks": [],
-        "archived_task_count": 0,
-        "guidance": (
-            "默认只读 PLAN「当前态（会话必读）」与开放「功能任务」；"
-            "不要整篇读取「档案（默认不读）」或反复阅读已完成任务，"
-            "除非回溯证据、放弃原因或用户明确要求。"
-        ),
-    }
-    if plan_path.is_file():
-        plan_state = read_plan_state(plan_path)
-        content = str(plan_state["content"])
-        plan_meta["status"] = plan_state["status"]
-        plan_meta["approval"] = plan_state["approval"]
-        plan_meta["current_goal"] = extract_markdown_section(content, "当前目标") or None
-        plan_meta["blockers_next"] = (
-            extract_markdown_section(content, "当前阻塞与下一步") or None
-        )
-        # 开放任务只取「功能任务」节，档案不计入 open_tasks
-        open_section = extract_markdown_section(content, "功能任务")
-        open_from_section: list[dict[str, str]] = []
-        for line in open_section.splitlines():
-            cells = parse_markdown_row(line, 5)
-            if cells is None:
-                continue
-            open_from_section.append(
-                {
-                    "id": cells[0],
-                    "summary": cells[1],
-                    "status": cells[2],
-                    "test_result": cells[3],
-                    "commit": cells[4],
-                }
-            )
-        plan_meta["open_tasks"] = open_from_section
-        archived_section = extract_markdown_section(content, "已完成任务")
-        archived_count = 0
-        for line in archived_section.splitlines():
-            if parse_markdown_row(line, 5) is not None:
-                archived_count += 1
-        plan_meta["archived_task_count"] = archived_count
-
-    handoffs = list_handoffs_for_agent(
-        project_root=project_root,
-        agent_id=normalized,
-        role="any",
-        statuses=set(ACTIVE_HANDOFF_STATUSES),
-    )
-    must_read: list[dict[str, str]] = []
-    for handoff in handoffs:
-        if handoff.get("doc_exists") != "true":
+def relevant_contracts(
+    data: dict[str, Any], role_id: str, capability: str | None
+) -> list[dict[str, Any]]:
+    matches: list[dict[str, Any]] = []
+    for contract in data["contracts"].values():
+        if capability and contract.get("capability") != capability:
             continue
-        must_read.append(
-            {
-                "id": handoff["id"],
-                "role": handoff["role"],
-                "status": handoff["status"],
-                "doc": handoff["document_path"],
-                "deliverable": handoff["deliverable"],
-                "acceptance": handoff["acceptance"],
-            }
+        if contract.get("status") not in DISCOVERABLE_STATUSES:
+            continue
+        if role_id != contract.get("provider") and role_id not in contract.get(
+            "consumers", []
+        ):
+            continue
+        matches.append(contract_for_output(contract))
+    return sorted(matches, key=lambda item: item["id"])
+
+
+def command_context(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    discipline = role_discipline(args.role_id)
+    capability = (
+        validate_id(args.capability, "capability") if args.capability else None
+    )
+    data, exists = load_state(root)
+    payload = {
+        "role_id": args.role_id,
+        "discipline": discipline,
+        "role_reference": str(SKILL_ROOT / ROLE_REFERENCES[discipline]),
+        "capability": capability,
+        "capability_state": data["capabilities"].get(capability) if capability else None,
+        "contracts": relevant_contracts(data, args.role_id, capability),
+        "active": data["active"].get(capability) if capability else None,
+        "milestone_count": len(data["milestones"]),
+        "state_exists": exists,
+    }
+    emit(payload, args.json)
+
+
+def verification_entries(
+    actor: str, evidence: Sequence[str] | None, timestamp: str
+) -> list[dict[str, str]]:
+    return [
+        {"by": actor, "evidence": item, "at": timestamp}
+        for item in (evidence or [])
+    ]
+
+
+def command_contract_publish(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    contract_id = validate_id(args.id, "contract id")
+    capability = validate_id(args.capability, "capability")
+    role_discipline(args.provider)
+    consumers = unique(args.consumer)
+    for consumer in consumers:
+        role_discipline(consumer)
+    if args.status == "blocked" and not args.note:
+        raise VTeamError("blocked 契约必须用 --note 说明阻塞原因")
+
+    data, _ = load_state(root)
+    existing = data["contracts"].get(contract_id)
+    if existing:
+        if existing.get("capability") != capability:
+            raise VTeamError("同一 contract id 不得改变 capability")
+        if existing.get("provider") != args.provider:
+            raise VTeamError("同一 contract id 不得改变 provider")
+
+    timestamp = utc_now()
+    verification = list(existing.get("verification", [])) if existing else []
+    verification.extend(verification_entries(args.provider, args.verification, timestamp))
+    contract: dict[str, Any] = {
+        "id": contract_id,
+        "capability": capability,
+        "provider": args.provider,
+        "consumers": consumers,
+        "source": args.source,
+        "source_ref": args.source_ref,
+        "status": args.status,
+        "version": args.version,
+        "breaking": args.breaking,
+        "verification": verification,
+        "updated_at": timestamp,
+    }
+    if existing and "created_at" in existing:
+        contract["created_at"] = existing["created_at"]
+    else:
+        contract["created_at"] = timestamp
+    if args.mock:
+        contract["mock"] = args.mock
+    elif existing and existing.get("mock"):
+        contract["mock"] = existing["mock"]
+    if args.note:
+        contract["note"] = args.note
+    elif existing and existing.get("note"):
+        contract["note"] = existing["note"]
+    data["contracts"][contract_id] = contract
+    path = save_state(root, data)
+    emit({"action": "published", "state": str(path), "contract": contract}, args.json)
+
+
+def find_contract(data: dict[str, Any], contract_id: str) -> dict[str, Any]:
+    contract = data["contracts"].get(contract_id)
+    if not contract:
+        raise VTeamError(f"契约不存在: {contract_id}")
+    return contract
+
+
+def discover_contracts(
+    data: dict[str, Any], capability: str, consumer: str
+) -> list[dict[str, Any]]:
+    return sorted(
+        [
+            contract
+            for contract in data["contracts"].values()
+            if contract.get("capability") == capability
+            and consumer in contract.get("consumers", [])
+            and contract.get("status") in DISCOVERABLE_STATUSES
+        ],
+        key=lambda item: item["id"],
+    )
+
+
+def command_contract_discover(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    capability = validate_id(args.capability, "capability")
+    role_discipline(args.consumer)
+    data, _ = load_state(root)
+    matches = discover_contracts(data, capability, args.consumer)
+
+    if args.contract_id:
+        contract_id = validate_id(args.contract_id, "contract id")
+        matches = [item for item in matches if item["id"] == contract_id]
+        if not matches:
+            raise VTeamError(
+                f"未发现 capability={capability}、consumer={args.consumer}、"
+                f"id={contract_id} 的可用契约"
+            )
+
+    if not matches:
+        raise VTeamError(
+            f"未发现 capability={capability}、consumer={args.consumer} 的契约；"
+            "禁止猜测接口"
+        )
+    if len(matches) > 1:
+        candidates = ", ".join(item["id"] for item in matches)
+        raise SelectionRequired(
+            f"发现多个契约，需要用 --contract-id 明确选择: {candidates}"
         )
 
-    root_files = []
-    for name in ("AGENTS.md", "CLAUDE.md"):
-        if (project_root / name).is_file():
-            root_files.append(name)
-
-    return {
-        "agent_id": normalized,
-        "runtime": agent.get("runtime"),
-        "role": agent.get("role"),
-        "responsibility": agent.get("responsibility"),
-        "scope_statement": agent.get("scope_statement") or agent.get("responsibility"),
-        "modules": list(agent.get("modules") or []),
-        "write_whitelist": list(agent.get("write_whitelist") or []),
-        "collaboration_docs": list(agent.get("collaboration_docs") or []),
-        "paths": {
-            "agent_md": f"Plan/agents/{normalized}/AGENT.md",
-            "agent_md_exists": agent_path.is_file(),
-            "plan_md": f"Plan/agents/{normalized}/PLAN.md",
-            "plan_md_exists": plan_path.is_file(),
-            "project_md": "Plan/project.md",
-            "project_md_exists": project_md.is_file(),
-            "root_constraint_files": root_files,
+    emit(
+        {
+            "selection": "single",
+            "contract": contract_for_output(matches[0]),
         },
-        "plan": plan_meta,
-        "must_read_handoffs": must_read,
-        "handoff_count": len(handoffs),
-        "skip_guidance": [
-            "不要批量扫描 Plan/collaboration/active/",
-            "不要默认整篇读取 PLAN 档案区与已完成任务表",
-            "context 是索引：合同正文与代码仍需按 must_read / 任务定向 Read",
-            "根约束若本会话已读且未改，可跳过重读 AGENTS.md/CLAUDE.md",
-        ],
+        args.json,
+    )
+
+
+def command_contract_verify(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    contract_id = validate_id(args.id, "contract id")
+    role_discipline(args.verifier)
+    data, _ = load_state(root)
+    contract = find_contract(data, contract_id)
+    if contract.get("status") not in INTEGRATION_STATUSES:
+        raise VTeamError(
+            "只有 ready 或 verified 契约可以验证；请先由提供者发布可集成版本"
+        )
+    timestamp = utc_now()
+    contract.setdefault("verification", []).append(
+        {"by": args.verifier, "evidence": args.evidence, "at": timestamp}
+    )
+    contract["status"] = "verified"
+    contract["updated_at"] = timestamp
+    path = save_state(root, data)
+    emit({"action": "verified", "state": str(path), "contract": contract}, args.json)
+
+
+def command_contract_deprecate(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    contract_id = validate_id(args.id, "contract id")
+    if args.replacement:
+        validate_id(args.replacement, "replacement contract id")
+        if args.replacement == contract_id:
+            raise VTeamError("替代契约不能是自身")
+    data, _ = load_state(root)
+    contract = find_contract(data, contract_id)
+    contract["status"] = "deprecated"
+    contract["deprecation"] = {
+        "reason": args.reason,
+        "replacement": args.replacement,
+        "at": utc_now(),
     }
+    contract["updated_at"] = contract["deprecation"]["at"]
+    path = save_state(root, data)
+    emit({"action": "deprecated", "state": str(path), "contract": contract}, args.json)
 
 
-def format_agent_context(payload: dict[str, object]) -> str:
-    """description: 将 build_agent_context 结果格式化为 Agent 可直接消费的文本。"""
-    lines: list[str] = []
-    lines.append(f"CONTEXT agent_id={payload['agent_id']}")
-    lines.append(f"  runtime: {payload.get('runtime')}")
-    lines.append(f"  role: {payload.get('role')}")
-    lines.append(f"  responsibility: {payload.get('responsibility')}")
-    lines.append(f"  scope: {payload.get('scope_statement')}")
-    modules = payload.get("modules") or []
-    lines.append("  modules:")
-    if modules:
-        for item in modules:
-            lines.append(f"    - {item}")
-    else:
-        lines.append("    - (none)")
-    lines.append("  write_whitelist:")
-    whitelist = payload.get("write_whitelist") or []
-    if whitelist:
-        for item in whitelist:
-            lines.append(f"    - {item}")
-    else:
-        lines.append("    - (none)")
+def command_resume_set(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    capability = validate_id(args.capability, "capability")
+    role_discipline(args.role)
+    data, _ = load_state(root)
+    record: dict[str, Any] = {
+        "capability": capability,
+        "role": args.role,
+        "summary": args.summary,
+        "next_step": args.next_step,
+        "updated_at": utc_now(),
+    }
+    if args.blocker:
+        record["blocker"] = args.blocker
+    if args.reference:
+        record["references"] = unique(args.reference)
+    data["active"][capability] = record
+    path = save_state(root, data)
+    emit({"action": "resume-set", "state": str(path), "active": record}, args.json)
 
-    paths = payload.get("paths") or {}
-    lines.append("paths:")
-    lines.append(
-        f"  agent_md: {paths.get('agent_md')} exists={paths.get('agent_md_exists')}"
-    )
-    lines.append(
-        f"  plan_md: {paths.get('plan_md')} exists={paths.get('plan_md_exists')}"
-    )
-    lines.append(
-        f"  project_md: {paths.get('project_md')} exists={paths.get('project_md_exists')}"
-    )
-    roots = paths.get("root_constraint_files") or []
-    lines.append(
-        "  root_constraints: " + (", ".join(roots) if roots else "(none)")
-    )
 
-    plan = payload.get("plan") or {}
-    lines.append("plan_stub:")
-    lines.append(f"  status: {plan.get('status')}")
-    lines.append(f"  approval: {plan.get('approval')}")
-    lines.append(f"  archived_task_count: {plan.get('archived_task_count')}")
-    goal = plan.get("current_goal")
-    if goal:
-        lines.append("  current_goal:")
-        for goal_line in str(goal).splitlines():
-            lines.append(f"    {goal_line}")
-    else:
-        lines.append("  current_goal: (empty)")
-    blockers = plan.get("blockers_next")
-    if blockers:
-        lines.append("  blockers_next:")
-        for blocker_line in str(blockers).splitlines():
-            lines.append(f"    {blocker_line}")
-    open_tasks = plan.get("open_tasks") or []
-    lines.append("  open_tasks:")
-    if open_tasks:
-        for task in open_tasks:
-            lines.append(
-                f"    - {task.get('id')}: {task.get('summary')} "
-                f"[{task.get('status')}]"
+def command_resume_clear(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    capability = validate_id(args.capability, "capability")
+    data, exists = load_state(root)
+    if not exists or capability not in data["active"]:
+        emit({"action": "resume-clear", "cleared": False}, args.json)
+        return
+    del data["active"][capability]
+    path = save_state(root, data)
+    emit({"action": "resume-clear", "cleared": True, "state": str(path)}, args.json)
+
+
+def command_module_complete(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    capability = validate_id(args.capability, "capability")
+    contract_ids = unique(args.contract or [])
+    data, _ = load_state(root)
+    for contract_id in contract_ids:
+        validate_id(contract_id, "contract id")
+        contract = find_contract(data, contract_id)
+        if contract.get("capability") != capability:
+            raise VTeamError(f"契约 {contract_id} 不属于 capability {capability}")
+        if contract.get("status") not in INTEGRATION_STATUSES:
+            raise VTeamError(
+                f"契约 {contract_id} 状态为 {contract.get('status')}，"
+                "模块完成前必须是 ready 或 verified"
             )
-    else:
-        lines.append("    - (none)")
-    if plan.get("guidance"):
-        lines.append(f"  guidance: {plan.get('guidance')}")
-
-    must_read = payload.get("must_read_handoffs") or []
-    lines.append(f"must_read_handoffs: count={len(must_read)}")
-    if must_read:
-        for handoff in must_read:
-            lines.append(
-                f"  - {handoff.get('id')} role={handoff.get('role')} "
-                f"status={handoff.get('status')}"
-            )
-            lines.append(f"    doc: {handoff.get('doc')}")
-            lines.append(f"    deliverable: {handoff.get('deliverable')}")
-            lines.append(f"    acceptance: {handoff.get('acceptance')}")
-    else:
-        lines.append("  - (none; list empty or docs missing)")
-
-    lines.append("skip_guidance:")
-    for item in payload.get("skip_guidance") or []:
-        lines.append(f"  - {item}")
-    lines.append(
-        "next: Read AGENT.md（若未读）→ 仅 Read must_read 对接正文 → "
-        "按需打开 PLAN 当前态；默认不读档案。"
+    completed = {
+        "status": "completed",
+        "summary": args.summary,
+        "contracts": contract_ids,
+        "verification": unique(args.verification),
+        "completed_at": utc_now(),
+    }
+    data["capabilities"][capability] = completed
+    cleared_active = data["active"].pop(capability, None) is not None
+    path = save_state(root, data)
+    emit(
+        {
+            "action": "module-complete",
+            "state": str(path),
+            "capability": capability,
+            "completed": completed,
+            "cleared_active": cleared_active,
+        },
+        args.json,
     )
-    return "\n".join(lines) + "\n"
+
+
+def command_milestone_record(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    milestone_id = validate_id(args.id, "milestone id")
+    capability = validate_id(args.capability, "capability")
+    data, _ = load_state(root)
+    if any(item.get("id") == milestone_id for item in data["milestones"]):
+        raise VTeamError(f"里程碑已存在: {milestone_id}")
+    milestone = {
+        "id": milestone_id,
+        "capability": capability,
+        "summary": args.summary,
+        "references": unique(args.reference),
+        "recorded_at": utc_now(),
+    }
+    data["milestones"].append(milestone)
+    path = save_state(root, data)
+    emit({"action": "milestone-recorded", "state": str(path), "milestone": milestone}, args.json)
+
+
+def command_milestone_list(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    data, _ = load_state(root)
+    items = data["milestones"]
+    if args.capability:
+        capability = validate_id(args.capability, "capability")
+        items = [item for item in items if item.get("capability") == capability]
+    emit(
+        {
+            "milestones": [
+                {
+                    "id": item["id"],
+                    "capability": item["capability"],
+                    "summary": item["summary"],
+                }
+                for item in items
+            ]
+        },
+        args.json,
+    )
+
+
+def command_milestone_show(args: argparse.Namespace) -> None:
+    root = project_root_from(args.project_root)
+    milestone_id = validate_id(args.id, "milestone id")
+    data, _ = load_state(root)
+    for item in data["milestones"]:
+        if item.get("id") == milestone_id:
+            emit({"milestone": item}, args.json)
+            return
+    raise VTeamError(f"里程碑不存在: {milestone_id}")
+
+
+def add_project_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--project-root", required=True, help="产品项目根目录")
+
+
+def add_json_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true", help="输出单行 JSON")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """description: 构建 V-Team 命令行参数解析器。
-
-    Args:
-        无。
-
-    Returns:
-        包含 init、agent、context、check-plan、check-scope、cleanup、plan-git 与 handoff 子命令的 ArgumentParser。
-
-    Raises:
-        无。
-    """
     parser = argparse.ArgumentParser(
-        description="初始化和维护 Codex/Claude 多 Agent 项目约束。"
+        description="V-Team capability 状态与跨角色契约索引（普通任务无需使用）"
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = subparsers.add_parser("init", help="初始化无版本 Plan 结构")
-    init_parser.add_argument("--project-root", required=True, type=Path)
-    init_parser.add_argument(
-        "--runtime",
-        required=True,
-        action="append",
-        choices=sorted(VALID_RUNTIMES),
-    )
+    context_parser = commands.add_parser("context", help="读取当前角色的最小上下文")
+    add_project_argument(context_parser)
+    context_parser.add_argument("--role-id", required=True)
+    context_parser.add_argument("--capability")
+    add_json_argument(context_parser)
+    context_parser.set_defaults(handler=command_context)
 
-    agent_parser = subparsers.add_parser("agent", help="新增或更新 Agent 身份")
-    agent_parser.add_argument("--project-root", required=True, type=Path)
-    agent_parser.add_argument("--agent-id", required=True)
-    agent_parser.add_argument(
-        "--runtime",
-        required=True,
-        choices=sorted(VALID_RUNTIMES),
-    )
-    agent_parser.add_argument("--role", required=True)
-    agent_parser.add_argument("--responsibility", required=True)
-    agent_parser.add_argument(
-        "--scope",
-        help="用户授权的业务或项目范围；未提供时使用 --responsibility",
-    )
-    agent_parser.add_argument("--module", action="append", required=True)
-    agent_parser.add_argument("--allow", action="append", required=True)
-    agent_parser.add_argument("--read-doc", action="append", default=[])
+    contract_parser = commands.add_parser("contract", help="管理跨角色契约索引")
+    contract_commands = contract_parser.add_subparsers(dest="contract_command", required=True)
 
-    context_parser = subparsers.add_parser(
-        "context",
-        help="会话冷启动索引：身份、白名单、计划摘要与必读 handoff",
-    )
-    context_parser.add_argument("--project-root", required=True, type=Path)
-    context_parser.add_argument("--agent-id", required=True)
-    context_parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="as_json",
-        help="以 JSON 输出完整上下文字典",
-    )
+    publish = contract_commands.add_parser("publish", help="创建或更新契约索引")
+    add_project_argument(publish)
+    publish.add_argument("--id", required=True)
+    publish.add_argument("--capability", required=True)
+    publish.add_argument("--provider", required=True)
+    publish.add_argument("--consumer", action="append", required=True)
+    publish.add_argument("--source", choices=CONTRACT_SOURCES, required=True)
+    publish.add_argument("--source-ref", required=True)
+    publish.add_argument("--status", choices=PUBLISHABLE_STATUSES, default="draft")
+    publish.add_argument("--version", default="1")
+    publish.add_argument("--breaking", action="store_true")
+    publish.add_argument("--mock")
+    publish.add_argument("--note")
+    publish.add_argument("--verification", action="append")
+    add_json_argument(publish)
+    publish.set_defaults(handler=command_contract_publish)
 
-    plan_parser = subparsers.add_parser(
-        "check-plan",
-        help="在用户审批前校验计划 review 门禁",
-    )
-    plan_parser.add_argument("--project-root", required=True, type=Path)
-    plan_parser.add_argument("--agent-id", required=True)
+    discover = contract_commands.add_parser("discover", help="按能力和消费者发现契约")
+    add_project_argument(discover)
+    discover.add_argument("--capability", required=True)
+    discover.add_argument("--consumer", required=True)
+    discover.add_argument("--contract-id")
+    add_json_argument(discover)
+    discover.set_defaults(handler=command_contract_discover)
 
-    scope_parser = subparsers.add_parser(
-        "check-scope",
-        help="本地提交前统一检查一次变更路径",
-    )
-    scope_parser.add_argument("--project-root", required=True, type=Path)
-    scope_parser.add_argument("--agent-id", required=True)
+    verify = contract_commands.add_parser("verify", help="记录消费者验证")
+    add_project_argument(verify)
+    verify.add_argument("--id", required=True)
+    verify.add_argument("--verifier", required=True)
+    verify.add_argument("--evidence", required=True)
+    add_json_argument(verify)
+    verify.set_defaults(handler=command_contract_verify)
 
-    cleanup_parser = subparsers.add_parser(
-        "cleanup",
-        help="清理关闭对接文档并重置完成或废弃计划",
-    )
-    cleanup_parser.add_argument("--project-root", required=True, type=Path)
-    cleanup_parser.add_argument("--agent-id", required=True)
+    deprecate = contract_commands.add_parser("deprecate", help="停用契约")
+    add_project_argument(deprecate)
+    deprecate.add_argument("--id", required=True)
+    deprecate.add_argument("--reason", required=True)
+    deprecate.add_argument("--replacement")
+    add_json_argument(deprecate)
+    deprecate.set_defaults(handler=command_contract_deprecate)
 
-    handoff_parser = subparsers.add_parser(
-        "handoff",
-        help="精确列出、创建或检查跨 Agent 临时对接",
-    )
-    handoff_subparsers = handoff_parser.add_subparsers(
-        dest="handoff_command",
-        required=True,
-    )
+    resume_parser = commands.add_parser("resume", help="维护跨会话的单条恢复状态")
+    resume_commands = resume_parser.add_subparsers(dest="resume_command", required=True)
+    resume_set = resume_commands.add_parser("set", help="覆盖当前 capability 的恢复状态")
+    add_project_argument(resume_set)
+    resume_set.add_argument("--capability", required=True)
+    resume_set.add_argument("--role", required=True)
+    resume_set.add_argument("--summary", required=True)
+    resume_set.add_argument("--next-step", required=True)
+    resume_set.add_argument("--blocker")
+    resume_set.add_argument("--reference", action="append")
+    add_json_argument(resume_set)
+    resume_set.set_defaults(handler=command_resume_set)
 
-    handoff_list = handoff_subparsers.add_parser(
-        "list",
-        help="按 Agent 精确列出应读的对接文档",
-    )
-    handoff_list.add_argument("--project-root", required=True, type=Path)
-    handoff_list.add_argument("--agent-id", required=True)
-    handoff_list.add_argument(
-        "--role",
-        choices=["any", "receiver", "proposer"],
-        default="any",
-        help="过滤参与角色；默认 any",
-    )
-    handoff_list.add_argument(
-        "--status",
-        default="open,in-progress",
-        help="逗号分隔状态过滤；默认 open,in-progress",
-    )
+    resume_clear = resume_commands.add_parser("clear", help="清除指定 capability 的恢复状态")
+    add_project_argument(resume_clear)
+    resume_clear.add_argument("--capability", required=True)
+    add_json_argument(resume_clear)
+    resume_clear.set_defaults(handler=command_resume_clear)
 
-    handoff_show = handoff_subparsers.add_parser(
-        "show",
-        help="按 ID 查看单条对接登记",
-    )
-    handoff_show.add_argument("--project-root", required=True, type=Path)
-    handoff_show.add_argument("--id", required=True, dest="handoff_id")
+    module_parser = commands.add_parser("module", help="记录模块当前完成事实")
+    module_commands = module_parser.add_subparsers(dest="module_command", required=True)
+    complete = module_commands.add_parser("complete", help="完成模块并清除恢复状态")
+    add_project_argument(complete)
+    complete.add_argument("--capability", required=True)
+    complete.add_argument("--summary", required=True)
+    complete.add_argument("--verification", action="append", required=True)
+    complete.add_argument("--contract", action="append")
+    add_json_argument(complete)
+    complete.set_defaults(handler=command_module_complete)
 
-    handoff_create = handoff_subparsers.add_parser(
-        "create",
-        help="一键登记对接并生成 active 文档",
-    )
-    handoff_create.add_argument("--project-root", required=True, type=Path)
-    handoff_create.add_argument(
-        "--from",
-        required=True,
-        dest="proposer",
-        help="提出者 agent-id",
-    )
-    handoff_create.add_argument(
-        "--to",
-        required=True,
-        dest="receiver",
-        help="接收者 agent-id",
-    )
-    handoff_create.add_argument("--topic", required=True)
-    handoff_create.add_argument("--deliverable", required=True)
-    handoff_create.add_argument("--acceptance", required=True)
-    handoff_create.add_argument(
-        "--id",
-        dest="handoff_id",
-        help="可选对接 ID；默认自动生成 Hn",
-    )
+    milestone_parser = commands.add_parser("milestone", help="显式维护重大里程碑引用")
+    milestone_commands = milestone_parser.add_subparsers(dest="milestone_command", required=True)
+    record = milestone_commands.add_parser("record", help="记录重大里程碑")
+    add_project_argument(record)
+    record.add_argument("--id", required=True)
+    record.add_argument("--capability", required=True)
+    record.add_argument("--summary", required=True)
+    record.add_argument("--reference", action="append", required=True)
+    add_json_argument(record)
+    record.set_defaults(handler=command_milestone_record)
 
-    handoff_doctor = handoff_subparsers.add_parser(
-        "doctor",
-        help="检查孤儿文档、缺失路径与无效 Agent",
-    )
-    handoff_doctor.add_argument("--project-root", required=True, type=Path)
+    milestone_list = milestone_commands.add_parser("list", help="列出紧凑里程碑索引")
+    add_project_argument(milestone_list)
+    milestone_list.add_argument("--capability")
+    add_json_argument(milestone_list)
+    milestone_list.set_defaults(handler=command_milestone_list)
 
-    plan_git_parser = subparsers.add_parser(
-        "plan-git",
-        help="Plan/ 默认排除；仅用户明确要求时允许强制纳入本地 Git",
-    )
-    plan_git_sub = plan_git_parser.add_subparsers(
-        dest="plan_git_command",
-        required=True,
-    )
-    plan_git_status_parser = plan_git_sub.add_parser(
-        "status",
-        help="查看 Plan 本地排除与用户授权状态",
-    )
-    plan_git_status_parser.add_argument("--project-root", required=True, type=Path)
-    plan_git_allow_parser = plan_git_sub.add_parser(
-        "allow-stage",
-        help="用户明确要求后：写授权标记并用 git add -f 暂存 Plan/",
-    )
-    plan_git_allow_parser.add_argument("--project-root", required=True, type=Path)
-    plan_git_allow_parser.add_argument(
-        PLAN_GIT_CONFIRM_FLAG,
-        action="store_true",
-        dest="user_confirmed",
-        help="必须由用户明确要求纳入 Plan 后才可传入",
-    )
-    plan_git_revoke_parser = plan_git_sub.add_parser(
-        "revoke",
-        help="撤销 Plan 本地提交授权并恢复 /Plan/ 排除",
-    )
-    plan_git_revoke_parser.add_argument("--project-root", required=True, type=Path)
+    milestone_show = milestone_commands.add_parser("show", help="读取一个里程碑")
+    add_project_argument(milestone_show)
+    milestone_show.add_argument("--id", required=True)
+    add_json_argument(milestone_show)
+    milestone_show.set_defaults(handler=command_milestone_show)
 
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """description: 解析命令并执行对应的项目维护操作。
-
-    Args:
-        argv: 不含程序名的命令行参数；为空时读取 sys.argv。
-
-    Returns:
-        0 表示成功，1 表示已知配置或文件错误，2 表示范围越界、未确认的 plan-git、或 handoff 业务拒绝/doctor 发现问题。
-
-    Raises:
-        SystemExit: argparse 在参数格式错误时终止并返回标准退出码。
-    """
     parser = build_parser()
-    arguments = parser.parse_args(argv)
-
+    args = parser.parse_args(argv)
     try:
-        if arguments.command == "init":
-            initialize_project(arguments.project_root, arguments.runtime)
-            print(f"项目已初始化: {arguments.project_root}")
-            return 0
-
-        if arguments.command == "agent":
-            upsert_agent(
-                project_root=arguments.project_root,
-                agent_id=arguments.agent_id,
-                runtime=arguments.runtime,
-                role=arguments.role,
-                responsibility=arguments.responsibility,
-                modules=arguments.module,
-                write_whitelist=arguments.allow,
-                collaboration_docs=arguments.read_doc,
-                scope_statement=arguments.scope,
-            )
-            print(f"Agent 已更新: {arguments.agent_id}")
-            return 0
-
-        if arguments.command == "context":
-            payload = build_agent_context(
-                project_root=arguments.project_root,
-                agent_id=arguments.agent_id,
-            )
-            if arguments.as_json:
-                print(json.dumps(payload, ensure_ascii=False, indent=2))
-            else:
-                print(format_agent_context(payload), end="")
-            return 0
-
-        if arguments.command == "check-plan":
-            check_plan(
-                project_root=arguments.project_root,
-                agent_id=arguments.agent_id,
-            )
-            print(f"Review 检查通过: {arguments.agent_id}")
-            return 0
-
-        if arguments.command == "check-scope":
-            violations = check_scope(
-                project_root=arguments.project_root,
-                agent_id=arguments.agent_id,
-            )
-            if not violations:
-                print(f"范围检查通过: {arguments.agent_id}")
-                return 0
-
-            print(f"发现白名单外路径，Agent: {arguments.agent_id}", file=sys.stderr)
-            plan_violations = [
-                path for path in violations if path.startswith(PLAN_PATH_PREFIX)
-            ]
-            ordinary_violations = [
-                path for path in violations if path not in plan_violations
-            ]
-            for violation in violations:
-                print(f"- {violation}", file=sys.stderr)
-            if plan_violations:
-                print(
-                    "Plan/ 默认不得提交。仅当用户明确要求后，运行 "
-                    f"plan-git allow-stage {PLAN_GIT_CONFIRM_FLAG} "
-                    "强制暂存；提交完成后建议 plan-git revoke。",
-                    file=sys.stderr,
-                )
-            if ordinary_violations:
-                print(
-                    "暂停当前本地提交；请向用户说明修改原因和影响，并询问是否允许本次提交。",
-                    file=sys.stderr,
-                )
-                print(
-                    "用户同意后只在当前 PLAN.md 记录一次性授权；该授权不会扩大永久白名单。",
-                    file=sys.stderr,
-                )
-            return 2
-
-        if arguments.command == "cleanup":
-            deleted_paths = cleanup_agent_plan(
-                project_root=arguments.project_root,
-                agent_id=arguments.agent_id,
-            )
-            if deleted_paths:
-                paths_text = ", ".join(path.as_posix() for path in deleted_paths)
-                print(f"计划已重置，已清理对接文档: {paths_text}")
-            else:
-                print("计划已重置，没有需要清理的对接文档")
-            orphan_count = count_orphan_active_documents(arguments.project_root)
-            if orphan_count:
-                print(
-                    f"提示: 发现 {orphan_count} 个未登记的 active 文档，"
-                    "可运行 handoff doctor 查看",
-                    file=sys.stderr,
-                )
-            return 0
-
-        if arguments.command == "plan-git":
-            if arguments.plan_git_command == "status":
-                status = plan_git_status(arguments.project_root)
-                print(json.dumps(status, ensure_ascii=False, indent=2))
-                return 0
-            if arguments.plan_git_command == "allow-stage":
-                if not arguments.user_confirmed:
-                    print(
-                        "错误: 缺少用户明确确认标志 "
-                        f"{PLAN_GIT_CONFIRM_FLAG}；"
-                        "Agent 不得自行把 Plan/ 写入 Git。",
-                        file=sys.stderr,
-                    )
-                    return 2
-                staged = stage_plan_for_local_git(
-                    arguments.project_root,
-                    confirmed=True,
-                )
-                print(
-                    "已按用户明确要求授权并强制暂存 Plan/ "
-                    f"({len(staged)} 个路径)。本地提交后建议运行 plan-git revoke。"
-                )
-                for path in staged:
-                    print(f"- {path}")
-                return 0
-            if arguments.plan_git_command == "revoke":
-                removed = revoke_plan_git_allow(arguments.project_root)
-                if removed:
-                    print("已撤销 Plan 本地提交授权，并恢复 /Plan/ 本地排除。")
-                else:
-                    print("无活动授权；已确保 /Plan/ 本地排除（若为 Git 仓库）。")
-                return 0
-
-        if arguments.command == "handoff":
-            if arguments.handoff_command == "list":
-                rows = list_handoffs_for_agent(
-                    project_root=arguments.project_root,
-                    agent_id=arguments.agent_id,
-                    role=arguments.role,
-                    statuses=parse_status_filter(arguments.status),
-                )
-                print(format_handoff_list(rows), end="")
-                return 0
-
-            if arguments.handoff_command == "show":
-                row = show_handoff(
-                    project_root=arguments.project_root,
-                    handoff_id=arguments.handoff_id,
-                )
-                print(format_handoff_list([row]), end="")
-                return 0
-
-            if arguments.handoff_command == "create":
-                created = create_handoff(
-                    project_root=arguments.project_root,
-                    proposer=arguments.proposer,
-                    receiver=arguments.receiver,
-                    topic=arguments.topic,
-                    deliverable=arguments.deliverable,
-                    acceptance=arguments.acceptance,
-                    handoff_id=arguments.handoff_id,
-                )
-                print(
-                    f"对接已创建: {created['id']} -> {created['document_path']}"
-                )
-                return 0
-
-            if arguments.handoff_command == "doctor":
-                issues = collect_handoff_doctor_issues(arguments.project_root)
-                report = format_doctor_report(issues)
-                if issues:
-                    print(report, end="", file=sys.stderr)
-                    return 2
-                print(report, end="")
-                return 0
-    except HandoffRejected as error:
-        print(f"错误: {error}", file=sys.stderr)
-        return 2
-    except (FileNotFoundError, OSError, RuntimeError, ValueError) as error:
-        print(f"错误: {error}", file=sys.stderr)
+        args.handler(args)
+    except VTeamError as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return exc.exit_code
+    except OSError as exc:
+        print(f"文件操作失败: {exc}", file=sys.stderr)
         return 1
-
-    print(f"错误: 未支持的命令 {arguments.command}", file=sys.stderr)
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

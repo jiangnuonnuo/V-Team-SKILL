@@ -1,5 +1,0 @@
-{
-  "project_name": {{PROJECT_NAME_JSON}},
-  "runtimes": {{RUNTIMES_JSON}},
-  "agents": []
-}

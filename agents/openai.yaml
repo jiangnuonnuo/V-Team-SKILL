@@ -1,4 +1,7 @@
 interface:
   display_name: "V-Team"
-  short_description: "Multi-agent project skill: identity, whitelist, plan approval, handoff list/create, check-scope"
-  default_prompt: "Use $v-team to set up project-local multi-agent collaboration: confirm agent identity and business scope, write one approval-gated PLAN.md, use handoff list to read exact handoff docs (never scan active/), create handoffs only when another agent must integrate, enforce check-plan/check-scope, and keep Plan/ local (never commit them)."
+  short_description: "按功能选择角色链路，先评估方案，再开发并通过契约完成对接"
+  default_prompt: "使用 $v-team 为当前功能判断任务路线，选择最小的需求、架构、后端、前端和 QA 角色链路；标准功能先在对话中完成价值、需求与技术方案沟通，经我确认后再实现，并用可发现的契约完成前后端对接。"
+
+policy:
+  allow_implicit_invocation: false
