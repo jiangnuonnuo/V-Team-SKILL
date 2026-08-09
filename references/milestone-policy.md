@@ -6,7 +6,7 @@
 
 `.vteam/state.json` 最多保存 capability 当前事实、contract 索引、每个 capability 一条 active，以及重大 milestone 引用。不保存聊天、方案正文、接口正文、测试日志或历史版本。
 
-跨会话暂停时用 `resume set` 覆盖当前 active；恢复上下文只读当前 capability；完成或放弃时清除。若状态已经存在，模块闭环后用 `module complete` 更新当前事实并清除 active。普通功能不为了记录完成而首次创建状态。
+跨会话暂停时用 `resume set` 覆盖当前 active。恢复时用 context 只读当前 capability、角色和相关契约，直接执行记录的下一步；方案未实质变化时不重新分析或确认。完成或放弃时清除 active。若状态已经存在，模块闭环后用 `module complete` 更新当前事实并清除 active。普通功能不为了记录完成而首次创建状态。
 
 ## 重大里程碑
 

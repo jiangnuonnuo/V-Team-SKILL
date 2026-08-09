@@ -55,7 +55,10 @@ class CliTestCase(unittest.TestCase):
         capability: str = "sandbox-runtime",
         provider: str = "backend-sandbox-api",
     ) -> dict:
-        return self.json_result(
+        source = self.project / "api/openapi.yaml"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("openapi: 3.1.0\n", encoding="utf-8")
+        arguments = [
             "contract",
             "publish",
             "--project-root",
@@ -78,8 +81,13 @@ class CliTestCase(unittest.TestCase):
             "1.0.0",
             "--mock",
             "fixtures/sandbox.json",
-            "--json",
-        )
+        ]
+        if status == "ready":
+            arguments.extend(
+                ["--verification", "provider contract check passed"]
+            )
+        arguments.append("--json")
+        return self.json_result(*arguments)
 
 
 class ContextTests(CliTestCase):
@@ -125,6 +133,38 @@ class ContextTests(CliTestCase):
         self.assertEqual([item["id"] for item in payload["contracts"]], ["sandbox-api"])
         self.assertNotIn("milestones", payload)
 
+    def test_frontend_context_without_capability_lists_contract_inbox(self) -> None:
+        self.publish(contract_id="sandbox-api", status="ready")
+        self.publish(
+            contract_id="billing-api",
+            status="ready",
+            consumer="frontend-sandbox-console",
+            capability="billing",
+            provider="backend-billing-api",
+        )
+        self.publish(
+            contract_id="admin-api",
+            status="ready",
+            consumer="frontend-admin-console",
+            capability="admin",
+            provider="backend-admin-api",
+        )
+
+        payload = self.json_result(
+            "context",
+            "--project-root",
+            str(self.project),
+            "--role-id",
+            "frontend-sandbox-console",
+            "--json",
+        )
+
+        self.assertEqual(
+            [item["id"] for item in payload["contracts"]],
+            ["billing-api", "sandbox-api"],
+        )
+        self.assertIsNone(payload["capability"])
+
     def test_invalid_functional_role_is_rejected(self) -> None:
         result = self.run_cli(
             "context",
@@ -148,11 +188,92 @@ class ContractLifecycleTests(CliTestCase):
         self.assertEqual(contract["consumers"], ["frontend-sandbox-console"])
         self.assertEqual(contract["source"], "openapi")
         self.assertEqual(contract["source_ref"], "api/openapi.yaml#/sandbox")
+        self.assertEqual(contract["verification"][-1]["by"], "backend-sandbox-api")
         self.assertNotIn("request", contract)
         self.assertNotIn("response", contract)
         self.assertEqual(
             [path.relative_to(self.project).as_posix() for path in self.project.rglob("*") if path.is_file()],
-            [".vteam/state.json"],
+            ["api/openapi.yaml", ".vteam/state.json"],
+        )
+
+    def test_publish_rejects_ready_without_provider_evidence(self) -> None:
+        source = self.project / "api/openapi.yaml"
+        source.parent.mkdir(parents=True)
+        source.write_text("openapi: 3.1.0\n", encoding="utf-8")
+        base_arguments = [
+            "contract",
+            "publish",
+            "--project-root",
+            str(self.project),
+            "--id",
+            "sandbox-api",
+            "--capability",
+            "sandbox-runtime",
+            "--provider",
+            "backend-sandbox-api",
+            "--consumer",
+            "frontend-sandbox-console",
+            "--source",
+            "openapi",
+            "--source-ref",
+            "api/openapi.yaml",
+            "--status",
+            "ready",
+        ]
+        for evidence_arguments in ([], ["--verification", ""]):
+            with self.subTest(evidence_arguments=evidence_arguments):
+                result = self.run_cli(*(base_arguments + evidence_arguments))
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("直接验证证据", result.stderr)
+        self.assertFalse(self.state_path.exists())
+
+    def test_publish_rejects_missing_or_escaping_local_source(self) -> None:
+        for source_ref in ("api/missing.yaml", "../outside.yaml"):
+            with self.subTest(source_ref=source_ref):
+                result = self.run_cli(
+                    "contract",
+                    "publish",
+                    "--project-root",
+                    str(self.project),
+                    "--id",
+                    "sandbox-api",
+                    "--capability",
+                    "sandbox-runtime",
+                    "--provider",
+                    "backend-sandbox-api",
+                    "--consumer",
+                    "frontend-sandbox-console",
+                    "--source",
+                    "openapi",
+                    "--source-ref",
+                    source_ref,
+                )
+                self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.state_path.exists())
+
+    def test_publish_accepts_external_catalog_uri(self) -> None:
+        payload = self.json_result(
+            "contract",
+            "publish",
+            "--project-root",
+            str(self.project),
+            "--id",
+            "sandbox-api",
+            "--capability",
+            "sandbox-runtime",
+            "--provider",
+            "backend-sandbox-api",
+            "--consumer",
+            "frontend-sandbox-console",
+            "--source",
+            "openapi",
+            "--source-ref",
+            "https://catalog.example.test/contracts/sandbox-api",
+            "--json",
+        )
+        self.assertEqual(
+            payload["contract"]["source_ref"],
+            "https://catalog.example.test/contracts/sandbox-api",
         )
 
     def test_publish_updates_same_identity_but_cannot_rebind_it(self) -> None:
@@ -276,6 +397,21 @@ class ContractLifecycleTests(CliTestCase):
         self.assertIn("只有 ready", rejected.stderr)
 
         self.publish(status="ready")
+        empty_evidence = self.run_cli(
+            "contract",
+            "verify",
+            "--project-root",
+            str(self.project),
+            "--id",
+            "sandbox-api",
+            "--verifier",
+            "frontend-sandbox-console",
+            "--evidence",
+            "",
+        )
+        self.assertEqual(empty_evidence.returncode, 2)
+        self.assertIn("证据不能为空", empty_evidence.stderr)
+
         verified = self.json_result(
             "contract",
             "verify",
@@ -294,6 +430,23 @@ class ContractLifecycleTests(CliTestCase):
             verified["contract"]["verification"][-1]["by"],
             "frontend-sandbox-console",
         )
+
+    def test_verify_rejects_role_not_registered_as_consumer(self) -> None:
+        self.publish(status="ready")
+        result = self.run_cli(
+            "contract",
+            "verify",
+            "--project-root",
+            str(self.project),
+            "--id",
+            "sandbox-api",
+            "--verifier",
+            "frontend-admin-console",
+            "--evidence",
+            "unrelated integration",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("不是契约登记的 consumer", result.stderr)
 
     def test_deprecated_contract_is_not_discoverable(self) -> None:
         self.publish(status="ready")
@@ -487,25 +640,28 @@ class MilestoneTests(CliTestCase):
 
 
 class SkillContractTests(unittest.TestCase):
-    def test_skill_is_explicit_and_uses_four_task_routes(self) -> None:
+    def test_skill_is_explicit_and_separates_mode_risk_and_role(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         interface = (REPOSITORY_ROOT / "agents/openai.yaml").read_text(encoding="utf-8")
         self.assertIn("仅在用户明确调用 `$v-team`", skill)
         self.assertIn("allow_implicit_invocation: false", interface)
-        for route in ("问答/分析", "快速改动", "标准功能", "重大改造"):
-            self.assertIn(route, skill)
+        for mode in ("回答", "评估/设计", "实现", "修复", "恢复"):
+            self.assertIn(f"**{mode}**", skill)
+        for risk in ("快速", "标准", "重大"):
+            self.assertIn(f"**{risk}**", skill)
+        self.assertIn("当前角色", skill)
 
     def test_standard_feature_requires_value_architecture_and_user_approval(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         for requirement in (
-            "要解决的问题、价值",
-            "现有能力能否复用",
-            "推荐方案、关键风险",
+            "问题、价值和现有能力复用",
+            "目标、非目标和验收条件",
+            "推荐方案、关键风险和真实取舍",
             "仅在相关时说明架构、契约、迁移和回滚",
             "请求用户确认整份摘要一次",
         ):
             self.assertIn(requirement, skill)
-        self.assertIn("批准后连续执行到完成", skill)
+        self.assertIn("批准后连续执行", skill)
 
     def test_role_playbooks_have_distinct_chains(self) -> None:
         expected = {
@@ -521,7 +677,7 @@ class SkillContractTests(unittest.TestCase):
     def test_contract_policy_prevents_frontend_guessing(self) -> None:
         policy = (REFERENCES / "contract-policy.md").read_text(encoding="utf-8")
         self.assertIn("capability", policy)
-        self.assertIn("完整 consumer role ID", policy)
+        self.assertIn("完整角色 ID", policy)
         self.assertIn("零个", policy)
         self.assertIn("多个", policy)
         self.assertIn("禁止按相似名称", policy)
@@ -571,9 +727,10 @@ class SkillContractTests(unittest.TestCase):
         skill = SKILL.read_text(encoding="utf-8")
         self.assertLess(len(skill.splitlines()), 90)
         self.assertLess(len(skill.encode("utf-8")), 6000)
-        self.assertIn("进入某一阶段前只读该角色参考", skill)
+        self.assertIn("进入阶段前只读一个必要参考", skill)
         self.assertIn("不要预读所有角色", skill)
         expected = {
+            "debugging-policy.md",
             "role-requirement.md",
             "role-architect.md",
             "role-backend.md",
@@ -584,22 +741,36 @@ class SkillContractTests(unittest.TestCase):
         }
         self.assertEqual({path.name for path in REFERENCES.iterdir()}, expected)
 
-    def test_analysis_and_quick_change_are_terminal_single_read_routes(self) -> None:
+    def test_answer_assessment_and_quick_implementation_have_distinct_costs(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
-        self.assertIn("直接回答；不读任何 reference，不建 ID，不写状态", skill)
+        self.assertIn("不改代码，不读 reference，不建 ID，不写状态", skill)
         self.assertIn(
-            "直接实现并做最小充分验证；不读 reference，不写状态，不等待方案确认",
+            "只读对应角色 reference，在对话中交付结果后停止",
             skill,
         )
-        self.assertIn("选定后立即停止 V-Team 路由", skill)
+        self.assertIn(
+            "直接完成，不读角色 reference、不写状态、不等待方案确认",
+            skill,
+        )
+
+    def test_debug_and_resume_are_conditional_short_paths(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+        debugging = (REFERENCES / "debugging-policy.md").read_text(encoding="utf-8")
+        milestone = (REFERENCES / "milestone-policy.md").read_text(encoding="utf-8")
+        self.assertIn("先复现、定位根因，再做最小修复", skill)
+        self.assertIn("连续三次假设失败", debugging)
+        self.assertIn("不生成调试报告", debugging)
+        self.assertIn("不重新分析或确认", milestone)
+        self.assertIn("不重走已完成角色", skill)
 
     def test_skill_avoids_superpowers_style_process_amplification(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         self.assertIn("没有真实选择时不要凑替代方案", skill)
         self.assertIn("请求用户确认整份摘要一次", skill)
-        self.assertIn("批准后连续执行到完成", skill)
+        self.assertIn("批准后连续执行", skill)
         for forbidden in ("TodoWrite", "worktree", "subagent", "2-3 个方案", "每个步骤确认"):
             self.assertNotIn(forbidden, skill)
+        self.assertIn("不要默认全量测试、重复测试、独立一致性审查", skill)
 
     def test_skill_package_has_no_auxiliary_readme_or_router_reference(self) -> None:
         self.assertFalse((REPOSITORY_ROOT / "README.md").exists())
@@ -619,14 +790,16 @@ class SkillContractTests(unittest.TestCase):
             + reference("role-architect.md")
             + reference("contract-policy.md")
         )
-        all_conditional_references = skill + "".join(
-            path.read_text(encoding="utf-8") for path in sorted(REFERENCES.glob("*.md"))
+        debugging_fix = (
+            skill
+            + reference("debugging-policy.md")
+            + reference("role-backend.md")
         )
 
-        self.assertLess(len(quick_change), 2500)
-        self.assertLess(len(backend_feature), 2800)
-        self.assertLess(len(fullstack_decision), 3500)
-        self.assertLess(len(all_conditional_references), 5000)
+        self.assertLess(len(quick_change), 2700)
+        self.assertLess(len(backend_feature), 2900)
+        self.assertLess(len(fullstack_decision), 3900)
+        self.assertLess(len(debugging_fix), 3100)
 
 
 if __name__ == "__main__":

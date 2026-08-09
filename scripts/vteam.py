@@ -15,6 +15,7 @@ STATE_VERSION = 2
 STATE_RELATIVE_PATH = Path(".vteam/state.json")
 SKILL_ROOT = Path(__file__).resolve().parents[1]
 ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+URI_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*://\S+$", re.IGNORECASE)
 ROLE_PATTERN = re.compile(
     r"^(requirement|product|architect|backend|frontend|qa)"
     r"(?:-[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)?$"
@@ -147,6 +148,34 @@ def unique(values: Sequence[str]) -> list[str]:
     return list(dict.fromkeys(values))
 
 
+def nonempty(values: Sequence[str] | None) -> list[str]:
+    return [value.strip() for value in (values or []) if value.strip()]
+
+
+def validate_source_ref(project_root: Path, value: str) -> str:
+    """校验契约来源：外部 URI 明确可定位，本地引用必须指向项目内文件。"""
+    source_ref = value.strip()
+    if not source_ref:
+        raise VTeamError("source_ref 不能为空")
+    if URI_PATTERN.fullmatch(source_ref):
+        return source_ref
+
+    file_part = source_ref.split("#", 1)[0].split("::", 1)[0]
+    if not file_part:
+        raise VTeamError("本地 source_ref 必须包含文件路径")
+    relative_path = Path(file_part)
+    if relative_path.is_absolute():
+        raise VTeamError("本地 source_ref 必须使用项目相对路径")
+    resolved_path = (project_root / relative_path).resolve()
+    try:
+        resolved_path.relative_to(project_root)
+    except ValueError as exc:
+        raise VTeamError("本地 source_ref 不得逃逸项目目录") from exc
+    if not resolved_path.is_file():
+        raise VTeamError(f"本地 source_ref 文件不存在: {file_part}")
+    return source_ref
+
+
 def contract_for_output(contract: dict[str, Any]) -> dict[str, Any]:
     result = dict(contract)
     result["integration_allowed"] = contract.get("status") in INTEGRATION_STATUSES
@@ -213,10 +242,13 @@ def command_contract_publish(args: argparse.Namespace) -> None:
     capability = validate_id(args.capability, "capability")
     role_discipline(args.provider)
     consumers = unique(args.consumer)
+    provider_evidence = nonempty(args.verification)
     for consumer in consumers:
         role_discipline(consumer)
     if args.status == "blocked" and not args.note:
         raise VTeamError("blocked 契约必须用 --note 说明阻塞原因")
+    if args.status == "ready" and not provider_evidence:
+        raise VTeamError("ready 契约必须用 --verification 提供一次直接验证证据")
 
     data, _ = load_state(root)
     existing = data["contracts"].get(contract_id)
@@ -225,17 +257,18 @@ def command_contract_publish(args: argparse.Namespace) -> None:
             raise VTeamError("同一 contract id 不得改变 capability")
         if existing.get("provider") != args.provider:
             raise VTeamError("同一 contract id 不得改变 provider")
+    source_ref = validate_source_ref(root, args.source_ref)
 
     timestamp = utc_now()
     verification = list(existing.get("verification", [])) if existing else []
-    verification.extend(verification_entries(args.provider, args.verification, timestamp))
+    verification.extend(verification_entries(args.provider, provider_evidence, timestamp))
     contract: dict[str, Any] = {
         "id": contract_id,
         "capability": capability,
         "provider": args.provider,
         "consumers": consumers,
         "source": args.source,
-        "source_ref": args.source_ref,
+        "source_ref": source_ref,
         "status": args.status,
         "version": args.version,
         "breaking": args.breaking,
@@ -252,7 +285,7 @@ def command_contract_publish(args: argparse.Namespace) -> None:
         contract["mock"] = existing["mock"]
     if args.note:
         contract["note"] = args.note
-    elif existing and existing.get("note"):
+    elif args.status == "blocked" and existing and existing.get("note"):
         contract["note"] = existing["note"]
     data["contracts"][contract_id] = contract
     path = save_state(root, data)
@@ -323,13 +356,18 @@ def command_contract_verify(args: argparse.Namespace) -> None:
     role_discipline(args.verifier)
     data, _ = load_state(root)
     contract = find_contract(data, contract_id)
+    if args.verifier not in contract.get("consumers", []):
+        raise VTeamError(f"角色不是契约登记的 consumer: {args.verifier}")
     if contract.get("status") not in INTEGRATION_STATUSES:
         raise VTeamError(
             "只有 ready 或 verified 契约可以验证；请先由提供者发布可集成版本"
         )
+    evidence = args.evidence.strip()
+    if not evidence:
+        raise VTeamError("消费者验证证据不能为空")
     timestamp = utc_now()
     contract.setdefault("verification", []).append(
-        {"by": args.verifier, "evidence": args.evidence, "at": timestamp}
+        {"by": args.verifier, "evidence": evidence, "at": timestamp}
     )
     contract["status"] = "verified"
     contract["updated_at"] = timestamp
@@ -394,6 +432,9 @@ def command_module_complete(args: argparse.Namespace) -> None:
     root = project_root_from(args.project_root)
     capability = validate_id(args.capability, "capability")
     contract_ids = unique(args.contract or [])
+    completion_evidence = unique(nonempty(args.verification))
+    if not completion_evidence:
+        raise VTeamError("模块完成必须提供一条非空验证证据")
     data, _ = load_state(root)
     for contract_id in contract_ids:
         validate_id(contract_id, "contract id")
@@ -409,7 +450,7 @@ def command_module_complete(args: argparse.Namespace) -> None:
         "status": "completed",
         "summary": args.summary,
         "contracts": contract_ids,
-        "verification": unique(args.verification),
+        "verification": completion_evidence,
         "completed_at": utc_now(),
     }
     data["capabilities"][capability] = completed
