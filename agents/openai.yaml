@@ -1,7 +1,7 @@
 interface:
   display_name: "V-Team"
-  short_description: "按功能选择角色链路，先评估方案，再开发并通过契约完成对接"
-  default_prompt: "使用 $v-team 为当前功能判断任务路线，选择最小的需求、架构、后端、前端和 QA 角色链路；标准功能先在对话中完成价值、需求与技术方案沟通，经我确认后再实现，并用可发现的契约完成前后端对接。"
+  short_description: "按功能选择最小角色链路，确认方案后连续交付"
+  default_prompt: "使用 $v-team 判断任务路线；只对标准或重大功能先给紧凑方案并等待一次确认，之后按需切换角色、通过契约对接并连续完成。"
 
 policy:
   allow_implicit_invocation: false

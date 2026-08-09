@@ -498,23 +498,22 @@ class SkillContractTests(unittest.TestCase):
     def test_standard_feature_requires_value_architecture_and_user_approval(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         for requirement in (
-            "用户问题、价值与使用频率",
+            "要解决的问题、价值",
             "现有能力能否复用",
-            "可行性、约束、风险",
-            "兼容/迁移/回滚",
-            "明确请求用户确认该方案",
+            "推荐方案、关键风险",
+            "仅在相关时说明架构、契约、迁移和回滚",
+            "请求用户确认整份摘要一次",
         ):
             self.assertIn(requirement, skill)
-        self.assertIn("确认前", skill)
-        self.assertIn("不得开始功能实现", skill)
+        self.assertIn("批准后连续执行到完成", skill)
 
     def test_role_playbooks_have_distinct_chains(self) -> None:
         expected = {
-            "role-requirement.md": "不开发 / 复用 / 小改 / 新建",
+            "role-requirement.md": "区分真实问题与用户提出的解法",
             "role-architect.md": "组件关系、调用顺序、数据流",
             "role-backend.md": "契约优先",
             "role-frontend.md": "加载、空、成功、错误",
-            "role-qa.md": "轻量风险矩阵",
+            "role-qa.md": "通过、有条件通过或阻塞",
         }
         for filename, marker in expected.items():
             self.assertIn(marker, (REFERENCES / filename).read_text(encoding="utf-8"))
@@ -525,16 +524,16 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("完整 consumer role ID", policy)
         self.assertIn("零个", policy)
         self.assertIn("多个", policy)
-        self.assertIn("不得按相似名字", policy)
-        self.assertIn("不保存接口正文", policy)
+        self.assertIn("禁止按相似名称", policy)
+        self.assertIn("不复制字段和示例", policy)
 
     def test_process_artifacts_are_not_required(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
         milestone = (REFERENCES / "milestone-policy.md").read_text(encoding="utf-8")
-        self.assertIn("不为问题、分析、方案草稿、日常测试或普通状态新建文件", skill)
-        self.assertIn("不强制写 Markdown", milestone)
+        self.assertIn("不生成 PRD、设计稿或 PLAN 文件", skill)
+        self.assertIn("普通功能不为了记录完成而首次创建状态", milestone)
         self.assertIn("每个 capability 一条 active", milestone)
-        self.assertIn("普通模块完成不生成总结文档", skill)
+        self.assertIn("普通完成不新建总结或 ADR", skill)
 
     def test_legacy_governance_templates_and_commands_are_removed(self) -> None:
         legacy_files = {
@@ -569,11 +568,12 @@ class SkillContractTests(unittest.TestCase):
             self.assertNotIn(command, help_result.stdout)
 
     def test_skill_is_progressively_loaded_and_compact(self) -> None:
-        skill_lines = SKILL.read_text(encoding="utf-8").splitlines()
-        self.assertLess(len(skill_lines), 500)
-        self.assertIn("只读取对应参考", "\n".join(skill_lines))
+        skill = SKILL.read_text(encoding="utf-8")
+        self.assertLess(len(skill.splitlines()), 90)
+        self.assertLess(len(skill.encode("utf-8")), 6000)
+        self.assertIn("进入某一阶段前只读该角色参考", skill)
+        self.assertIn("不要预读所有角色", skill)
         expected = {
-            "role-router.md",
             "role-requirement.md",
             "role-architect.md",
             "role-backend.md",
@@ -583,6 +583,50 @@ class SkillContractTests(unittest.TestCase):
             "milestone-policy.md",
         }
         self.assertEqual({path.name for path in REFERENCES.iterdir()}, expected)
+
+    def test_analysis_and_quick_change_are_terminal_single_read_routes(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+        self.assertIn("直接回答；不读任何 reference，不建 ID，不写状态", skill)
+        self.assertIn(
+            "直接实现并做最小充分验证；不读 reference，不写状态，不等待方案确认",
+            skill,
+        )
+        self.assertIn("选定后立即停止 V-Team 路由", skill)
+
+    def test_skill_avoids_superpowers_style_process_amplification(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+        self.assertIn("没有真实选择时不要凑替代方案", skill)
+        self.assertIn("请求用户确认整份摘要一次", skill)
+        self.assertIn("批准后连续执行到完成", skill)
+        for forbidden in ("TodoWrite", "worktree", "subagent", "2-3 个方案", "每个步骤确认"):
+            self.assertNotIn(forbidden, skill)
+
+    def test_skill_package_has_no_auxiliary_readme_or_router_reference(self) -> None:
+        self.assertFalse((REPOSITORY_ROOT / "README.md").exists())
+        self.assertFalse((REFERENCES / "role-router.md").exists())
+
+    def test_common_scenarios_stay_within_context_character_budgets(self) -> None:
+        skill = SKILL.read_text(encoding="utf-8")
+
+        def reference(name: str) -> str:
+            return (REFERENCES / name).read_text(encoding="utf-8")
+
+        quick_change = skill
+        backend_feature = skill + reference("role-backend.md")
+        fullstack_decision = (
+            skill
+            + reference("role-requirement.md")
+            + reference("role-architect.md")
+            + reference("contract-policy.md")
+        )
+        all_conditional_references = skill + "".join(
+            path.read_text(encoding="utf-8") for path in sorted(REFERENCES.glob("*.md"))
+        )
+
+        self.assertLess(len(quick_change), 2500)
+        self.assertLess(len(backend_feature), 2800)
+        self.assertLess(len(fullstack_decision), 3500)
+        self.assertLess(len(all_conditional_references), 5000)
 
 
 if __name__ == "__main__":
