@@ -1,4 +1,4 @@
-"""V-Team 2.0 的角色路由、契约发现与轻量留档验收测试。"""
+"""V-Team 的 Capability 双 Lane、契约、恢复与 Playbook 验收测试。"""
 
 from __future__ import annotations
 
@@ -176,6 +176,20 @@ class ContextTests(CliTestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("角色 ID", result.stderr)
         self.assertFalse(self.state_path.exists())
+
+    def test_operations_context_routes_to_operations_reference(self) -> None:
+        payload = self.json_result(
+            "context",
+            "--project-root",
+            str(self.project),
+            "--role-id",
+            "operations-order-api",
+            "--json",
+        )
+        self.assertEqual(payload["discipline"], "operations")
+        self.assertTrue(
+            payload["role_reference"].endswith("references/role-operations.md")
+        )
 
 
 class ContractLifecycleTests(CliTestCase):
@@ -639,6 +653,235 @@ class MilestoneTests(CliTestCase):
         self.assertNotIn("references", listing["milestones"][0])
 
 
+class CapabilityLaneTests(CliTestCase):
+    def define_capability(
+        self, frontend: str = "required", backend: str = "no-change"
+    ) -> dict:
+        arguments = [
+            "capability", "define", "--project-root", str(self.project),
+            "--id", "order-export", "--summary", "export orders by current filters",
+            "--frontend", frontend, "--backend", backend,
+        ]
+        if frontend in {"no-change", "blocked"}:
+            arguments.extend(["--frontend-reason", "existing page is unchanged"])
+        if backend in {"no-change", "blocked"}:
+            arguments.extend(["--backend-reason", "existing API behavior is sufficient"])
+        arguments.append("--json")
+        return self.json_result(*arguments)
+
+    def test_capability_definition_always_persists_two_lanes(self) -> None:
+        payload = self.define_capability()
+        definition = payload["definition"]
+        self.assertEqual(definition["lanes"]["frontend"]["status"], "required")
+        self.assertEqual(definition["lanes"]["backend"]["status"], "no-change")
+        self.assertIn("reason", definition["lanes"]["backend"])
+        self.assertEqual(self.read_state()["schema_version"], 3)
+
+    def test_no_change_lane_requires_an_explicit_reason(self) -> None:
+        result = self.run_cli(
+            "capability", "define", "--project-root", str(self.project),
+            "--id", "order-export", "--summary", "export orders",
+            "--frontend", "no-change", "--backend", "required",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("frontend Lane 为 no-change", result.stderr)
+        self.assertFalse(self.state_path.exists())
+
+    def test_capability_completion_requires_both_lane_dispositions(self) -> None:
+        self.define_capability()
+        incomplete = self.run_cli(
+            "capability", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--summary", "export is ready",
+            "--verification", "feature review passed",
+        )
+        self.assertEqual(incomplete.returncode, 2)
+        self.assertIn("frontend/backend Lane", incomplete.stderr)
+        self.json_result(
+            "lane", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--lane", "frontend",
+            "--summary", "export action and download flow",
+            "--verification", "browser workflow passed", "--json",
+        )
+        completed = self.json_result(
+            "capability", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--summary", "order export is ready",
+            "--verification", "feature and architecture review passed", "--json",
+        )
+        self.assertEqual(completed["action"], "capability-complete")
+        state = self.read_state()["capabilities"]["order-export"]
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["lanes"]["frontend"]["status"], "completed")
+        self.assertEqual(state["lanes"]["backend"]["status"], "no-change")
+
+    def test_lane_no_change_command_requires_and_records_reason(self) -> None:
+        self.define_capability(frontend="required", backend="required")
+        payload = self.json_result(
+            "lane", "no-change", "--project-root", str(self.project),
+            "--capability", "order-export", "--lane", "backend",
+            "--reason", "existing export API already covers the feature", "--json",
+        )
+        self.assertEqual(payload["action"], "lane-no-change")
+        self.assertEqual(payload["state_record"]["status"], "no-change")
+        self.assertIn("reason", payload["state_record"])
+
+    def test_context_exposes_only_the_requested_lane(self) -> None:
+        self.define_capability(frontend="required", backend="required")
+        payload = self.json_result(
+            "context", "--project-root", str(self.project),
+            "--role-id", "frontend-order-export", "--capability", "order-export",
+            "--lane", "frontend", "--json",
+        )
+        self.assertEqual(payload["lane"]["status"], "required")
+        self.assertEqual(set(payload["capability_state"]["lanes"]), {"frontend"})
+        wrong_lane = self.run_cli(
+            "context", "--project-root", str(self.project),
+            "--role-id", "frontend-order-export", "--capability", "order-export",
+            "--lane", "backend",
+        )
+        self.assertEqual(wrong_lane.returncode, 2)
+        self.assertIn("必须与当前角色职能一致", wrong_lane.stderr)
+
+    def test_fullstack_capability_closes_after_ready_contract_and_two_lanes(self) -> None:
+        self.define_capability(frontend="required", backend="required")
+        self.json_result(
+            "lane", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--lane", "backend",
+            "--summary", "export endpoint", "--verification", "backend integration passed",
+            "--json",
+        )
+        self.publish(
+            contract_id="order-export-api",
+            status="ready",
+            capability="order-export",
+            provider="backend-order-export",
+            consumer="frontend-order-export",
+        )
+        self.json_result(
+            "lane", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--lane", "frontend",
+            "--summary", "export download workflow", "--verification", "browser integration passed",
+            "--json",
+        )
+        completed = self.json_result(
+            "capability", "complete", "--project-root", str(self.project),
+            "--capability", "order-export", "--summary", "fullstack export ready",
+            "--verification", "feature review passed",
+            "--contract", "order-export-api", "--json",
+        )
+        self.assertEqual(completed["completed"]["contracts"], ["order-export-api"])
+
+    def test_v2_state_is_read_compatibly_and_migrates_on_write(self) -> None:
+        self.state_path.parent.mkdir()
+        self.state_path.write_text(
+            json.dumps({
+                "schema_version": 2, "project": "product", "capabilities": {},
+                "contracts": {}, "active": {}, "milestones": [],
+            }),
+            encoding="utf-8",
+        )
+        payload = self.json_result(
+            "context", "--project-root", str(self.project),
+            "--role-id", "backend-order-export", "--json",
+        )
+        self.assertTrue(payload["state_exists"])
+        self.assertEqual(self.read_state()["schema_version"], 2)
+        self.json_result(
+            "resume", "set", "--project-root", str(self.project),
+            "--capability", "order-export", "--role", "backend-order-export",
+            "--function", "development", "--summary", "backend implementation in progress",
+            "--next-step", "publish ready contract", "--json",
+        )
+        migrated = self.read_state()
+        self.assertEqual(migrated["schema_version"], 3)
+        self.assertEqual(migrated["playbooks"], {})
+        self.assertEqual(migrated["active"]["order-export"]["function"], "development")
+
+    def test_state_rejects_secret_like_content(self) -> None:
+        result = self.run_cli(
+            "resume", "set", "--project-root", str(self.project),
+            "--capability", "order-export", "--role", "backend-order-export",
+            "--summary", "token=not-for-state", "--next-step", "continue implementation",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("不能包含密钥或凭据", result.stderr)
+        self.assertFalse(self.state_path.exists())
+
+
+class PlaybookTests(CliTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.makefile = self.project / "Makefile"
+        self.makefile.write_text("deploy:\n\t@true\nrollback:\n\t@true\n", encoding="utf-8")
+
+    def publish_operations_playbook(self, status: str = "verified") -> dict:
+        arguments = [
+            "playbook", "publish", "--project-root", str(self.project),
+            "--id", "deploy-order-api", "--function", "operations",
+            "--role", "operations-order-api", "--action", "deploy",
+            "--source-ref", "Makefile#deploy", "--rollback-ref", "Makefile#rollback",
+            "--success-check", "health check endpoint passed", "--status", status,
+        ]
+        if status == "verified":
+            arguments.extend(["--verification", "staging deployment and smoke test passed"])
+        arguments.append("--json")
+        return self.json_result(*arguments)
+
+    def test_operations_playbook_requires_rollback_and_discovers_verified_entry(self) -> None:
+        missing_rollback = self.run_cli(
+            "playbook", "publish", "--project-root", str(self.project),
+            "--id", "deploy-order-api", "--function", "operations",
+            "--role", "operations-order-api", "--action", "deploy",
+            "--source-ref", "Makefile#deploy", "--success-check", "health endpoint passed",
+        )
+        self.assertEqual(missing_rollback.returncode, 2)
+        self.assertIn("rollback-ref", missing_rollback.stderr)
+        self.publish_operations_playbook()
+        discovered = self.json_result(
+            "playbook", "discover", "--project-root", str(self.project),
+            "--function", "operations", "--role", "operations-order-api",
+            "--action", "deploy", "--json",
+        )
+        self.assertTrue(discovered["playbook"]["usable"])
+        self.assertEqual(discovered["playbook"]["rollback_ref"], "Makefile#rollback")
+
+    def test_playbook_rejects_secret_like_evidence_and_deprecation_hides_it(self) -> None:
+        result = self.run_cli(
+            "playbook", "publish", "--project-root", str(self.project),
+            "--id", "deploy-order-api", "--function", "operations",
+            "--role", "operations-order-api", "--action", "deploy",
+            "--source-ref", "Makefile#deploy", "--rollback-ref", "Makefile#rollback",
+            "--success-check", "health endpoint passed", "--status", "verified",
+            "--verification", "token=not-for-state",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.state_path.exists())
+        self.publish_operations_playbook()
+        self.json_result(
+            "playbook", "deprecate", "--project-root", str(self.project),
+            "--id", "deploy-order-api", "--reason", "replaced by release pipeline", "--json",
+        )
+        unavailable = self.run_cli(
+            "playbook", "discover", "--project-root", str(self.project),
+            "--function", "operations", "--role", "operations-order-api", "--action", "deploy",
+        )
+        self.assertEqual(unavailable.returncode, 2)
+        self.assertIn("未发现", unavailable.stderr)
+        reverify = self.run_cli(
+            "playbook",
+            "verify",
+            "--project-root",
+            str(self.project),
+            "--id",
+            "deploy-order-api",
+            "--verifier",
+            "operations-order-api",
+            "--evidence",
+            "staging retry passed",
+        )
+        self.assertEqual(reverify.returncode, 2)
+        self.assertIn("已停用", reverify.stderr)
+
+
 class SkillContractTests(unittest.TestCase):
     def test_skill_is_explicit_and_separates_mode_risk_and_role(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
@@ -649,7 +892,7 @@ class SkillContractTests(unittest.TestCase):
             self.assertIn(f"**{mode}**", skill)
         for risk in ("快速", "标准", "重大"):
             self.assertIn(f"**{risk}**", skill)
-        self.assertIn("当前角色", skill)
+        self.assertIn("Capability 与双 Lane", skill)
 
     def test_standard_feature_requires_value_architecture_and_user_approval(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
@@ -657,7 +900,7 @@ class SkillContractTests(unittest.TestCase):
             "问题、价值和现有能力复用",
             "目标、非目标和验收条件",
             "推荐方案、关键风险和真实取舍",
-            "仅在相关时说明架构、契约、迁移和回滚",
+            "相关时说明架构、契约、迁移、回滚和部署",
             "请求用户确认整份摘要一次",
         ):
             self.assertIn(requirement, skill)
@@ -725,19 +968,22 @@ class SkillContractTests(unittest.TestCase):
 
     def test_skill_is_progressively_loaded_and_compact(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
-        self.assertLess(len(skill.splitlines()), 90)
-        self.assertLess(len(skill.encode("utf-8")), 6000)
+        self.assertLess(len(skill.splitlines()), 120)
+        self.assertLess(len(skill.encode("utf-8")), 9000)
         self.assertIn("进入阶段前只读一个必要参考", skill)
         self.assertIn("不要预读所有角色", skill)
         expected = {
             "debugging-policy.md",
+            "capability-policy.md",
             "role-requirement.md",
             "role-architect.md",
             "role-backend.md",
             "role-frontend.md",
             "role-qa.md",
+            "role-operations.md",
             "contract-policy.md",
             "milestone-policy.md",
+            "playbook-policy.md",
         }
         self.assertEqual({path.name for path in REFERENCES.iterdir()}, expected)
 
@@ -745,11 +991,11 @@ class SkillContractTests(unittest.TestCase):
         skill = SKILL.read_text(encoding="utf-8")
         self.assertIn("不改代码，不读 reference，不建 ID，不写状态", skill)
         self.assertIn(
-            "只读对应角色 reference，在对话中交付结果后停止",
+            "只读必要 reference，在对话中交付结论后停止",
             skill,
         )
         self.assertIn(
-            "直接完成，不读角色 reference、不写状态、不等待方案确认",
+            "直接完成，只验证直接结果",
             skill,
         )
 
@@ -761,7 +1007,7 @@ class SkillContractTests(unittest.TestCase):
         self.assertIn("连续三次假设失败", debugging)
         self.assertIn("不生成调试报告", debugging)
         self.assertIn("不重新分析或确认", milestone)
-        self.assertIn("不重走已完成角色", skill)
+        self.assertIn("直接进入记录的功能环节", skill)
 
     def test_skill_avoids_superpowers_style_process_amplification(self) -> None:
         skill = SKILL.read_text(encoding="utf-8")
@@ -796,10 +1042,10 @@ class SkillContractTests(unittest.TestCase):
             + reference("role-backend.md")
         )
 
-        self.assertLess(len(quick_change), 2700)
-        self.assertLess(len(backend_feature), 2900)
-        self.assertLess(len(fullstack_decision), 3900)
-        self.assertLess(len(debugging_fix), 3100)
+        self.assertLess(len(quick_change), 6000)
+        self.assertLess(len(backend_feature), 7200)
+        self.assertLess(len(fullstack_decision), 9200)
+        self.assertLess(len(debugging_fix), 7200)
 
 
 if __name__ == "__main__":

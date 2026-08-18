@@ -6,7 +6,7 @@
 
 接口正文必须留在产品仓库或既有平台的 OpenAPI、GraphQL Schema、protobuf、JSON Schema、共享类型或契约测试中。已有 Catalog/Registry 时复用；否则 `.vteam/state.json` 只保存定位索引，不复制字段和示例。本地 `source_ref` 必须指向实际文件；外部平台使用明确 URI。
 
-索引字段：`id`、`capability`、`provider`、`consumers`、`source`、`source_ref`、`status`、`version`、`breaking`，以及可选的 `mock`、`verification`。
+索引字段：`id`、`capability`、`provider`、`consumers`、`source`、`source_ref`、`status`、`version`、`breaking`，以及可选的 `mock`、`verification`。公共全栈 capability 通常由 backend Lane 提供、frontend Lane 消费。
 
 ## 状态
 

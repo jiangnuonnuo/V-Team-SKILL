@@ -1,7 +1,7 @@
 interface:
   display_name: "V-Team"
-  short_description: "按操作模式、风险等级和当前角色选择最小功能交付链路，减少无效流程"
-  default_prompt: "使用 $v-team 判断操作模式、风险和当前角色；仅在必要时确认方案、读取参考或启用契约，并以最小验证连续完成。"
+  short_description: "按 Capability 双 Lane 完成需求、架构、前后端、联调、评审与按需运维"
+  default_prompt: "使用 $v-team 为这个功能评估 frontend/backend 双 Lane，并按风险完成方案、实现、联调与验收。"
 
 policy:
   allow_implicit_invocation: false
